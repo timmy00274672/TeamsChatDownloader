@@ -3,3 +3,13 @@ node_modules/
 exports/
 test-results/
 *.tmp
+
+*.zip
+report*.json
+compact*.txt
+*.png
+codex.log
+.env
+_box_ref*
+_ref_*
+CODEX_TASK.md

@@ -29,5 +29,32 @@ launcher.onclick=()=>{host.style.display=host.style.display==='none'?'block':'no
 const run=mode=>scanner.start({scope:$('scope').value,mode,from:$('from').value,to:$('to').value,captureImages:$('saveImages').checked}).catch(e=>$('status').textContent=e.message);
 $('start').onclick=()=>run('range');$('history').onclick=()=>run('history');$('stop').onclick=()=>scanner.stop();
 $('resume').onclick=async()=>{try{const job=scanner.job||await GM_getValue(key,null);await scanner.resume(job,{captureImages:$('saveImages').checked});}catch(e){$('status').textContent=e.message;}};
-$('download').onclick=async()=>{try{const job=scanner.job||await GM_getValue(key,null),type=$('format').value;const blob=type==='zip'?await TeamsChatArchive.build(job,mediaStore):new Blob([TeamsChatFormats.format(job,type)],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`teams-chat-${new Date(job.created).toISOString().slice(0,10)}.${type}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),120000);}catch(e){$('status').textContent=e.message;}};
+async function download(type){try{const job=scanner.job||await GM_getValue(key,null);const blob=type==='zip'?await TeamsChatArchive.build(job,mediaStore):new Blob([TeamsChatFormats.format(job,type)],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`teams-chat-${new Date(job.created).toISOString().slice(0,10)}.${type}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),120000);}catch(e){$('status').textContent=e.message;}}
+$('download').onclick=()=>download($('format').value);
+let autoPending=false;
+async function autoRun(options,consumeHash=false){
+ if(autoPending||scanner.running)return;autoPending=true;host.style.display='block';
+ try{
+  $('status').textContent='自動匯出：等待 Teams 聊天介面／登入…';
+  const end=Date.now()+600000;
+  while(true){
+   if(Date.now()>end)throw Error('等待 Teams 聊天介面逾時');
+   const profile=document.querySelector('[data-tid="me-control-avatar-trigger"]');
+   if(profile?.getClientRects().length&&document.querySelector('[role="tree"],[data-tid="app-bar-wrapper"]')){try{await TeamsChatUtils.identify();break;}catch{}}
+   await new Promise(r=>setTimeout(r,500));
+  }
+  if(scanner.running)return;
+  if(consumeHash)history.replaceState(history.state,'',location.pathname+location.search);
+  $('scope').value='all';$('from').value=local(Date.parse(options.from));$('to').value=local(Date.parse(options.to));$('format').value=options.format;
+  // Automatic runs use local DOM image capture; never request screen sharing here.
+  const previous=scanner.job;
+  try{await scanner.start({...options,captureImages:$('saveImages').checked});}
+  finally{if(options.autodownload&&scanner.job&&scanner.job!==previous)await download(options.format);}
+ }catch(e){$('status').textContent=e.message;}finally{autoPending=false;}
+}
+function hashTrigger(){try{const options=TeamsChatUtils.parseAutoHash(location.hash);if(options)void autoRun(options,true);}catch(e){host.style.display='block';$('status').textContent=e.message;}}
+window.addEventListener('hashchange',hashTrigger);
+// Alt+Shift+E: previous weekday 07:00 Taipei through now, all chats, ZIP download.
+window.addEventListener('keydown',event=>{if(event.altKey&&event.shiftKey&&!event.ctrlKey&&!event.metaKey&&event.code==='KeyE'&&!event.repeat&&!event.isComposing){event.preventDefault();const r=TeamsChatUtils.defaultAutoRange();void autoRun({scope:'all',mode:'range',from:new Date(r.from).toISOString(),to:new Date(r.to).toISOString(),format:'zip',autodownload:true});}});
+hashTrigger();
 })();

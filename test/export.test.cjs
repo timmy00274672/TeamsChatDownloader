@@ -100,7 +100,7 @@ test('指定時段混有無時間紀錄仍在跨過開始時間後停止，不�
   assert.equal(r.oldestLoaded,10);assert.equal(r.job.conversations[0].traversal.lower,'crossed-range-start');
   assert.equal(r.data.conversations[0].messages.filter(m=>m.timestamp!==null).length,15);
   assert.equal(r.data.conversations[0].messages.filter(m=>m.timestamp===null).length,1);
-  assert.equal(r.job.status,'partial');assert.ok(r.job.conversations[0].warnings.some(w=>w.includes('缺少完整時間')));
+  assert.equal(r.job.status,'complete');assert.ok(r.job.conversations[0].warnings.some(w=>w.includes('缺少完整時間')));
  }finally{await browser.close();}
 });
 

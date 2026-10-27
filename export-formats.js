@@ -20,6 +20,28 @@ function text(job){
   }
  }return lines.join('\n');
 }
+function compactText(message){
+ let value=String(message.text||''),reply=!!(message.quote||message.parent);
+ value=value.replace(/引用原文[：:]?\s*Begin quote[\s\S]*?End quote/gi,()=>{reply=true;return '';});
+ value=value.replace(/Begin quote[\s\S]*?End quote/gi,()=>{reply=true;return '';});
+ value=value.split(/\r?\n/).filter((line,index,lines)=>{
+  if(/^\s*引用原文[：:]/.test(line)||(/^\s*.{1,80}?\s+\d{1,2}\/\d{1,2}\/\d{4}\s+\d{1,2}:\d{2}\s*[AP]M\b/i.test(line)&&lines.slice(index+1).some(s=>s.trim()))){reply=true;return false;}return true;
+ }).join(' ');
+ // Teams copied reply headers repeat the author, date and quoted text.
+ value=value.replace(/^(?:\s*[^\n]{1,80}?\s+\d{1,2}\/\d{1,2}\/\d{4}\s+\d{1,2}:\d{2}\s*[AP]M\s+)([\s\S]*)$/i,(_,rest)=>{reply=true;return message.quote?rest.replace(message.quote,''):rest;});
+ value=value.replace(/\s+/g,' ').trim();if(value.length>300)value=value.slice(0,299)+'…';
+ return (reply?'↩ ':'')+value+((message.images||[]).length?' [img]':'');
+}
+function compact(job){
+ const j=exportObject(job),cs=j.conversations,inRange=m=>Number.isFinite(m.timestamp)&&m.timestamp>=j.range.from&&m.timestamp<j.range.to;
+ const active=cs.filter(c=>c.messages.some(inRange));let images={saved:0,missing:0};
+ for(const c of cs)for(const m of c.messages)for(const i of m.images||[])images[i.status==='saved'?'saved':'missing']++;
+ images=j.imageReport||images;
+ const duration=Math.max(0,((j.updated||j.created)-j.created)/60000);
+ const lines=[`status=${j.status} chats scanned=${cs.filter(c=>c.attempts>0||['complete','partial','failed','running'].includes(c.status)).length} skipped=${cs.filter(c=>c.status==='skipped').length} active=${active.length} in-range msgs=${cs.reduce((n,c)=>n+c.messages.filter(inRange).length,0)} no-time=${cs.reduce((n,c)=>n+c.messages.filter(m=>m.timestamp===null).length,0)} partial chats=${cs.filter(c=>c.status==='partial').length} images saved=${images.saved} missing=${images.missing} duration=${Number.isFinite(duration)?duration.toFixed(1):'0.0'} min`];
+ for(const c of active){lines.push('',`## ${String(c.name).replace(/\s+/g,' ')}`);for(const m of c.messages.filter(inRange)){const t=time(m.timestamp);lines.push(`${t.slice(5,10).replace('-','/')} ${t.slice(11,16)} ${String(m.sender||'作者不明').replace(/\s+/g,' ')}: ${compactText(m)}`);}}
+ return lines.join('\n');
+}
 function csv(job){
  const quote=s=>'"'+String(s??'').replace(/^[=+@-]/,"'$&").replaceAll('"','""')+'"';
  const rows=[['Chat','Time (Asia/Taipei)','Sender','Text','Attachments','Reply','Status']];
@@ -28,5 +50,5 @@ function csv(job){
 }
 function html(job){const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');return '<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'"><title>Teams 聊天匯出</title><style>body{font:15px system-ui;max-width:1000px;margin:30px auto;padding:20px}pre{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6}</style><pre>'+esc(text(job))+'</pre></html>';}
 function format(job,type){if(!job)throw Error('尚無匯出資料');switch(type){case 'json':return JSON.stringify(exportObject(job),null,2);case 'csv':return csv(job);case 'html':return html(job);default:return text(job);}}
-root.TeamsChatFormats={format,exportObject,time};
+root.TeamsChatFormats={format,exportObject,time,compact,compactText};
 })(globalThis);
