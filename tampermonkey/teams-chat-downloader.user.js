@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Teams Chat Downloader (DOM local)
 // @namespace    https://github.com/rahulmasal/TeamsChatDownloader
-// @version      1.4.0
+// @version      1.4.2
 // @description  Local DOM-only chat export with date ranges, batching and checkpoints.
 // @author       Rahul Masal; local adaptation
 // @match        https://teams.microsoft.com/*
@@ -176,6 +176,32 @@ function parseAutoHash(hash,now=Date.now()){
  const format=p.get('format')||'zip';if(!['zip','txt','json','csv','html'].includes(format))throw Error('不支援的匯出格式');
  return {scope:'all',mode:'range',from:new Date(range.from).toISOString(),to:new Date(range.to).toISOString(),format,autodownload:p.get('autodownload')==='1'};
 }
+// Keep Teams' history state and any router fragment following our opt-in fragment.
+function strippedURL(loc){return loc.pathname+loc.search+loc.hash.replace(/#teams-export=[^#]*/, '').replace(/^#$/, '');}
+function resumable(j){return !!j&&!j.abandoned&&(['running','waiting-login'].includes(j.status)||(j.status==='interrupted'&&j.conversations?.some(c=>!['complete','skipped'].includes(c.status))));}
+function logProgress(j,error,now=Date.now()){
+ j.lastStage=j.stage;j.lastProgressAt=new Date(now).toISOString();
+ if(error)j.lastError=error.message||String(error);
+ const index=j.currentChatIndex?j.currentChatIndex-1:j.conversations.findIndex(c=>c.status==='running');
+ const entry={t:j.lastProgressAt,stage:j.stage,chatIndex:index+1,chatTotal:j.conversations.length,chatName:j.conversations[index]?.name};
+ if(error)Object.assign(entry,{error:j.lastError,stackSnippet:String(error.stack||'').slice(0,1200)});
+ const last=j.progressLog?.at(-1);
+ if(last&&last.stage===entry.stage&&last.chatIndex===entry.chatIndex&&last.error===entry.error){last.repeat=(last.repeat||1)+1;last.t=entry.t;return;}
+ j.progressLog=[...(j.progressLog||[]),entry].slice(-150);
+}
+function statusText(s){return `${s.status}｜${s.stage}\n聊天 ${s.conversations.length}（略過 ${s.conversations.filter(c=>c.status==='skipped').length}）｜訊息 ${s.count}｜圖片 ${s.imageCount||0}\n${s.lastError||s.error||''}\n${s.lastStage||''}｜${s.lastProgressAt||''}`;}
+async function autoDownload(job,download){
+ if(!job?.autodownload||job.autoDownloadDone||!['complete','partial','failed','interrupted'].includes(job.status))return;
+ job.autoDownloadDone=true;
+ try{await download('zip');job.downloadedAt=Date.now();}catch(e){job.autoDownloadDone=false;throw e;}
+}
+// Store a complete snapshot in IndexedDB before publishing its small GM pointer.
+class Checkpoints{
+ constructor(store,get,set){Object.assign(this,{store,get,set});this.tail=Promise.resolve();}
+ save(job){const snapshot=structuredClone(job);const work=this.tail.catch(()=>{}).then(async()=>{await this.store.put(snapshot.id,'checkpoint',snapshot);const {conversations,...meta}=snapshot;await this.set({...meta,checkpoint:true,conversationCount:conversations.length});});this.tail=work;return work;}
+ async load(){await this.tail.catch(()=>{});const meta=await this.get();if(!meta?.checkpoint)return meta;const job=await this.store.get(meta.id,'checkpoint');if(!job)throw Error('本機進度資料遺失；請清除進度後重新掃描');return job;}
+ async clear(){await this.tail.catch(()=>{});await this.set(null);}
+}
 function skipBeforeRange(job,c){return job.scope==='all'&&job.mode==='range'&&knownTime(c.latest)&&Date.parse(c.latest)<job.range.from;}
 function current(){
  const pane=readPane();
@@ -215,11 +241,11 @@ function prepare(input={}){
  return {a,mode,scope,initial,range:makeRange(input)};
 }
 class Scanner{
- constructor({save=async()=>{},delay=900,maxSteps=2000,onUpdate=()=>{},loginTimeout=600000,captureProvider=null,mediaStore=null}={}){Object.assign(this,{save,delay,maxSteps,onUpdate,loginTimeout,captureProvider});this.mediaStore=mediaStore||(root.TeamsChatImages?new root.TeamsChatImages.MediaStore():null);this.job=null;this.running=false;this.cancelled=false;this.sequence=0;}
- check(){if(this.cancelled)throw stopped();}
+ constructor({save=async()=>{},delay=900,maxSteps=2000,onUpdate=()=>{},onInterrupt=()=>{},onTerminal=()=>{},loginTimeout=600000,captureProvider=null,mediaStore=null}={}){Object.assign(this,{save,delay,maxSteps,onUpdate,onInterrupt,onTerminal,loginTimeout,captureProvider});this.mediaStore=mediaStore||(root.TeamsChatImages?new root.TeamsChatImages.MediaStore():null);this.job=null;this.running=false;this.cancelled=false;this.sequence=0;this.watchdogMs=300000;}
+ check(){if(this.cancelled)throw this.interruption||stopped();}
  async wait(){this.check();await new Promise(r=>setTimeout(r,this.delay));this.check();}
- summary(){if(!this.job)return null;const j=this.job;return {id:j.id,status:j.status,stage:j.stage,range:j.range,scope:j.scope,mode:j.mode,account:j.account,conversations:j.conversations.map(c=>({key:c.key,name:c.name,status:c.status,count:this.selected(c).length,warnings:c.warnings,error:c.error,latest:c.latest,skipReason:c.skipReason})),count:j.conversations.reduce((n,c)=>n+this.selected(c).length,0),captureImages:j.captureImages,imageCount:j.conversations.reduce((n,c)=>n+this.selected(c).reduce((sum,m)=>sum+(m.images||[]).filter(i=>i.status==='saved').length,0),0),warnings:j.warnings,error:j.error,updated:j.updated};}
- async persist(){if(!this.job)return;this.job.updated=Date.now();this.onUpdate(this.summary());await this.save(this.job);}
+ summary(){if(!this.job)return null;const j=this.job;return {id:j.id,status:j.status,stage:j.stage,range:j.range,scope:j.scope,mode:j.mode,account:j.account,conversations:j.conversations.map(c=>({key:c.key,name:c.name,status:c.status,count:this.selected(c).length,warnings:c.warnings,error:c.error,reason:c.reason,latest:c.latest,skipReason:c.skipReason})),count:j.conversations.reduce((n,c)=>n+this.selected(c).length,0),captureImages:j.captureImages,imageCount:j.conversations.reduce((n,c)=>n+this.selected(c).reduce((sum,m)=>sum+(m.images||[]).filter(i=>i.status==='saved').length,0),0),warnings:j.warnings,error:j.error,lastError:j.lastError,lastStage:j.lastStage,lastProgressAt:j.lastProgressAt,updated:j.updated};}
+ async persist(){if(!this.job)return;this.job.updated=Date.now();logProgress(this.job);this.onUpdate(this.summary());await this.save(this.job);}
  selected(c){return c.messages.filter(m=>m.timestamp===null || this.job.mode==='history'||(m.timestamp>=this.job.range.from&&m.timestamp<this.job.range.to));}
  async auth(){
   const end=Date.now()+this.loginTimeout;
@@ -233,7 +259,7 @@ class Scanner{
   let prepared;try{await identify();this.check();prepared=prepare(input);if(input.captureImages&&!this.captureProvider)throw Error('請先啟用圖片擷取，並選擇此 Teams 分頁');}catch(e){this.running=false;throw e;}
   const {a,mode,scope,initial,range}=prepared;
   const conversations=initial.map(c=>this.newConversation(c));
-  this.job={version:2,id:crypto.randomUUID(),created:Date.now(),account:a,range,scope,mode,captureImages:!!input.captureImages,status:'running',stage:'準備中',discovery:{status:'pending'},warnings:['僅掃描網頁可列舉的聊天；隱藏／封存內容可能不在清單中。','所有頻道依需求排除。'],conversations};
+  this.job={autodownload:!!input.autodownload,format:input.format||'zip',version:2,id:crypto.randomUUID(),created:Date.now(),account:a,range,scope,mode,captureImages:!!input.captureImages,status:'running',stage:'準備中',discovery:{status:'pending'},warnings:['僅掃描網頁可列舉的聊天；隱藏／封存內容可能不在清單中。','所有頻道依需求排除。'],conversations};
   await this.execute();return this.job;
  }
  newConversation(c){return {...c,status:'pending',messages:[],warnings:[],traversal:{},attempts:0};}
@@ -245,10 +271,12 @@ class Scanner{
   this.job=structuredClone(job);if(options.captureImages&&!this.job.captureImages){this.job.captureImages=true;for(const c of this.job.conversations)if(c.status==='complete')c.status='pending';}await this.execute();return this.job;
  }
  stop(){this.cancelled=true;}
+ async interrupt(error){if(!this.job||!this.running||this.interruption)return;this.interruption=Object.assign(error,{stopped:true});this.cancelled=true;this.job.status='interrupted';this.job.error=error.message;logProgress(this.job,error);try{await this.persist();}finally{await this.onInterrupt(this.job);}}
+
  async rail(){
   const buttons=matches(null,'[data-tid="app-bar-wrapper"] button');
   const chat=buttons.find(e=>/^(Chat|聊天)$/i.test(buttonText(e)));
-  if(chat)chat.click();
+  if(!tree()&&chat)chat.click();
   for(let i=0;i<40&&!tree();i++)await this.wait();
   if(!tree())throw Error('找不到聊天清單，可能尚未載入或 Teams 已改版');
   const filters=matches(null,'[role="toolbar"] [role="checkbox"][aria-checked="true"], [role="toolbar"] [aria-pressed="true"]');
@@ -262,7 +290,7 @@ class Scanner{
   for(let n=0;n<this.maxSteps;n++){
    await this.auth();const r=readRail();if(r.filtered?.length)throw Error('清單仍有啟用中的篩選');
    for(const c of r.items){const existing=this.job.conversations.find(x=>x.key===c.key);if(existing){existing.name=c.name;if(c.latest)existing.latest=c.latest;}else this.job.conversations.push(this.newConversation(c));}
-   this.job.stage=`列舉聊天：${this.job.conversations.length} 個`;await this.persist();
+   this.job.stage=`列舉聊天 ${this.job.conversations.length}`;await this.persist();
    const folder=r.folders.find(v=>!expanded.has(v));
    if(folder){expanded.add(folder);expand(folder);await this.wait();if(item(folder)?.getAttribute('aria-expanded')==='false')throw Error('無法展開聊天資料夾');continue;}
    if(r.moreValues?.length){const e=item(r.moreValues[0]);e.scrollIntoView({block:'nearest'});e.click();await this.wait();continue;}
@@ -296,7 +324,7 @@ class Scanner{
   for(const m of raw){
    const time=knownTime(m.time)?Date.parse(m.time):null;
    const identity=m.id?'id:'+m.id:'uncertain:'+this.job.id+':'+(++this.sequence);
-   const converted={id:m.id,key:identity,sender:m.author||'作者不明',authorMissing:!m.author,timestamp:time,rawTime:m.rawTime,text:m.text,attachments:m.links||[],parent:m.parent,quote:m.quote,uncertainIdentity:!m.id};
+   const converted={id:m.id,key:identity,sender:m.author||'作者不明',authorMissing:!m.author,timestamp:time,timestampUnknownReason:time===null?'no valid timestamp in message DOM':undefined,rawTime:m.rawTime,text:m.text,attachments:m.links||[],parent:m.parent,quote:m.quote,uncertainIdentity:!m.id};
    const old=c.messages.find(x=>x.key===identity);
    converted.images=(m.images||[]).map(image=>{const prior=old?.images?.find(x=>x.index===image.index&&x.identity===image.identity&&x.url===image.url);return prior?{...image,...prior}:{...image,status:'link-only'};});
    if(old)Object.assign(old,converted);else c.messages.push(converted);
@@ -326,8 +354,9 @@ class Scanner{
  }
  viewport(){const e=matches(null,'[data-tid="message-pane-list-viewport"]')[0];if(!e)throw Error('找不到聊天捲動區');return e;}
  async scan(c){
+  c.traversal={};
   if(this.job.mode==='visible'){
-   const {pane}=await this.capture(c);c.status='partial';c.warnings.push('只讀取目前已載入畫面，未掃描全部歷史');c.traversal={snapshot:true};return;
+   const {pane}=await this.capture(c);c.status='partial';c.warnings.push('只讀取目前已載入畫面，未掃描全部歷史');c.traversal={snapshot:true};this.ensureReason(c);return;
   }
   let previous='',stable=0,bottom=false,lower=false;
   for(let i=0;i<this.maxSteps;i++){
@@ -355,35 +384,40 @@ class Scanner{
   if(c.messages.some(m=>m.authorMissing))c.warnings.push('部分紀錄缺少作者');
   c.warnings=[...new Set(c.warnings)];
   if(c.traversal.lower==='crossed-range-start')c.reason='stopped early: reached messages older than range';
-  const rangeCovered=bottom&&c.traversal.lower==='crossed-range-start';
-  const blocking=c.warnings.filter(w=>!w.startsWith('部分紀錄缺少完整時間')&&!(rangeCovered&&w==='部分紀錄缺少作者'));
-  c.status=bottom&&lower&&!blocking.length?'complete':'partial';
+  const rangeCovered=this.job.mode==='range'&&c.traversal.lower==='crossed-range-start';
+  const blocking=c.warnings.filter(w=>!w.startsWith('部分紀錄缺少完整時間')&&!(rangeCovered&&['部分紀錄缺少作者','未確認最新訊息的底部邊界'].includes(w)));
+  c.status=(rangeCovered||(bottom&&lower))&&!blocking.length?'complete':'partial';this.ensureReason(c);
+ }
+ ensureReason(c){
+  if(!['partial','failed'].includes(c.status))return;
+  c.reason=c.error||c.warnings?.join('; ')||(!c.traversal?.upper?'incomplete: latest messages boundary not confirmed':!c.traversal?.lower?'incomplete: did not reach range start':'incomplete: traversal could not confirm coverage');
  }
  async execute(){
-  this.running=true;this.cancelled=false;this.job.status='running';this.job.error=null;
+  this.running=true;this.cancelled=false;this.interruption=null;this.job.status='running';this.job.error=null;this.job.startedAt=Date.now();this.job.currentChatIndex=0;
+  const watchdog=setInterval(()=>{if(Date.now()-(this.job.updated||this.job.created)>this.watchdogMs)void this.interrupt(Error('階段逾時，已保留部分結果')).catch(()=>{});},1000);
   try{
    await this.persist();
-   if(this.job.scope==='all')await this.discover();else this.job.discovery={status:'complete',scope:'current'};
+   if(this.job.scope==='all'){if(this.job.discovery?.status!=='complete')await this.discover();}else this.job.discovery={status:'complete',scope:'current'};
    for(let i=0;i<this.job.conversations.length;i++){
-    this.check();const c=this.job.conversations[i];if(c.status==='complete')continue;
+    this.check();this.job.currentChatIndex=i+1;const c=this.job.conversations[i];if(c.status==='complete')continue;
     if(skipBeforeRange(this.job,c)){c.status='skipped';c.skipReason='skipped: last activity before range';c.error=c.skipReason;await this.persist();continue;}
     if(c.status==='skipped'){c.status='pending';c.skipReason=null;}
     this.job.stage=`${i+1}/${this.job.conversations.length}：${c.name}`;
-    c.status='running';c.error=null;c.warnings=[];await this.persist();
+    c.status='running';c.error=null;c.reason=null;c.warnings=[];await this.persist();
     for(let attempt=0;attempt<3;attempt++){
      c.attempts++;
      try{
       if(this.job.scope==='all')await this.open(c);else if(current().key!==c.key)throw Error('請回到原本的聊天再續抓');
-      await this.scan(c);c.error=null;break;
-     }catch(e){c.status='failed';c.error=e.message;await this.persist();if(e.stopped||e.captureUnavailable||/帳號|已切換|原本的聊天/.test(e.message))throw e;if(attempt<2)await this.wait();}
-    }await this.persist();
+      await this.scan(c);this.check();c.error=null;break;
+     }catch(e){c.status='failed';c.error=e.message;c.reason=e.message;await this.persist();if(e.stopped||e.captureUnavailable||/帳號|已切換|原本的聊天/.test(e.message))throw e;if(attempt<2)await this.wait();}
+    }this.ensureReason(c);await this.persist();
    }
    this.job.status=this.job.discovery.status==='complete'&&this.job.conversations.length&&this.job.conversations.every(c=>['complete','skipped'].includes(c.status))?'complete':'partial';this.job.stage='掃描結束';await this.persist();
-  }catch(e){this.job.status=e.stopped?'interrupted':'failed';this.job.error=e.message;try{await this.persist();}catch{};}
-  finally{this.running=false;this.onUpdate(this.summary());}
+  }catch(e){this.job.status=e.stopped?'interrupted':'failed';this.job.error=e.message;logProgress(this.job,e);try{await this.persist();}catch{};}
+  finally{clearInterval(watchdog);for(const c of this.job.conversations)this.ensureReason(c);this.running=false;this.onUpdate(this.summary());await this.onTerminal(this.job);}
  }
 }
-root.TeamsChatUtils={Scanner,parseDate,makeRange,defaultAutoRange,parseAutoHash,skipBeforeRange,validHost,current,account,identify,prepare};
+root.TeamsChatUtils={Scanner,Checkpoints,strippedURL,resumable,logProgress,statusText,autoDownload,parseDate,makeRange,defaultAutoRange,parseAutoHash,skipBeforeRange,validHost,current,account,identify,prepare};
 })(globalThis);
 
 /* Shared by the popup and standalone userscript. */
@@ -425,7 +459,7 @@ function compact(job){
  const active=cs.filter(c=>c.messages.some(inRange));let images={saved:0,missing:0};
  for(const c of cs)for(const m of c.messages)for(const i of m.images||[])images[i.status==='saved'?'saved':'missing']++;
  images=j.imageReport||images;
- const duration=Math.max(0,((j.updated||j.created)-j.created)/60000);
+ const duration=Math.max(0,((j.updated||j.created)-(j.startedAt||j.created))/60000);
  const lines=[`status=${j.status} chats scanned=${cs.filter(c=>c.attempts>0||['complete','partial','failed','running'].includes(c.status)).length} skipped=${cs.filter(c=>c.status==='skipped').length} active=${active.length} in-range msgs=${cs.reduce((n,c)=>n+c.messages.filter(inRange).length,0)} no-time=${cs.reduce((n,c)=>n+c.messages.filter(m=>m.timestamp===null).length,0)} partial chats=${cs.filter(c=>c.status==='partial').length} images saved=${images.saved} missing=${images.missing} duration=${Number.isFinite(duration)?duration.toFixed(1):'0.0'} min`];
  for(const c of active){lines.push('',`## ${String(c.name).replace(/\s+/g,' ')}`);for(const m of c.messages.filter(inRange)){const t=time(m.timestamp);lines.push(`${t.slice(5,10).replace('-','/')} ${t.slice(11,16)} ${String(m.sender||'作者不明').replace(/\s+/g,' ')}: ${compactText(m)}`);}}
  return lines.join('\n');
@@ -468,7 +502,7 @@ async function build(job,store){
   }else if(image.status!=='saved'&&j.captureImages)missing++;
  }
  j.imageReport={saved,missing};if(missing){j.status='partial';j.warnings.push(`${missing} 張圖片未保存，請查看各訊息的圖片連結與原因。`);}
- entries.unshift({name:'compact.txt',data:root.TeamsChatFormats.compact(j)},{name:'chat.txt',data:root.TeamsChatFormats.format(j,'txt')},{name:'report.json',data:JSON.stringify(j,null,2)});
+ entries.unshift({name:'progress-log.json',data:JSON.stringify(job.progressLog||[],null,2)},{name:'compact.txt',data:root.TeamsChatFormats.compact(j)},{name:'chat.txt',data:root.TeamsChatFormats.format(j,'txt')},{name:'report.json',data:JSON.stringify(j,null,2)});
  return zip(entries);
 }
 root.TeamsChatArchive={zip,build};
@@ -490,47 +524,60 @@ shadow.append(style,node('section',{},
  node('label',{},node('input',{id:'saveImages',type:'checkbox',checked:''}),' 保存圖片（ZIP 分開存檔）'),node('button',{id:'enableImages'},'啟用圖片擷取（需要時）'),
  node('small',{},'可以先直接掃描。若提示圖片受限制，再啟用擷取並選此 Teams 分頁。圖片僅存本機 PNG，不上傳。'),
  node('button',{id:'start'},'掃描指定時段'),node('button',{id:'history'},'目前聊天全部歷史'),node('button',{id:'resume'},'續抓本機進度'),node('button',{id:'stop'},'停止'),
- node('label',{},'格式',node('select',{id:'format'},...['zip','txt','json','csv','html'].map(t=>node('option',{},t)))),
- node('button',{id:'download'},'下載目前結果'),node('p',{id:'status'},'預設最近 24 小時'),
+ node('label',{},'格式',node('select',{id:'format'},...['zip','txt','json','csv','html'].map(t=>node('option',{value:t,...(t==='zip'?{selected:''}:{})},t)))),
+ node('button',{id:'discard'},'清除進度'),node('button',{id:'log'},'下載進度紀錄'),node('button',{id:'download'},'下載目前結果'),node('p',{id:'status'},'預設最近 24 小時'),
  node('small',{},'掃描可能將聊天標為已讀。請勿切換此分頁的聊天；重新整理後可續抓。資料只存於本機 userscript 儲存空間。')
 ));
 const $=id=>shadow.getElementById(id),local=t=>new Date(t+28800000).toISOString().slice(0,19);
 $('from').value=local(Date.now()-86400000);$('to').value=local(Date.now());
 const mediaStore=new TeamsChatImages.MediaStore();
 const captureSession=new TeamsChatImages.TabCapture({hide:()=>{const previous=[host.style.visibility,launcher.style.visibility];host.style.visibility='hidden';launcher.style.visibility='hidden';return ()=>{host.style.visibility=previous[0];launcher.style.visibility=previous[1];};},onState:ready=>{$('enableImages').textContent=ready?'圖片擷取已啟用':'啟用圖片擷取（需要時）';}});
-const scanner=new TeamsChatUtils.Scanner({mediaStore,captureProvider:captureSession,save:job=>GM_setValue(key,job),onUpdate:s=>{$('status').textContent=`${s.status}：${s.stage}\n${s.conversations.length} 個聊天，${s.count} 則，已保存圖片 ${s.imageCount||0} 張\n${s.error||''}`;for(const id of ['start','history','resume','enableImages','saveImages'])$(id).disabled=scanner.running;if(!scanner.running)captureSession.stop();}});
+const checkpoints=new TeamsChatUtils.Checkpoints(mediaStore,()=>GM_getValue(key,null),value=>GM_setValue(key,value));
+const scanner=new TeamsChatUtils.Scanner({mediaStore,captureProvider:captureSession,save:job=>checkpoints.save(job),onInterrupt:finishDownload,onTerminal:finishDownload,onUpdate:s=>{$('status').textContent=TeamsChatUtils.statusText(s);for(const id of ['start','history','resume','enableImages','saveImages'])$(id).disabled=scanner.running;if(!scanner.running)captureSession.stop();}});
 $('enableImages').onclick=async()=>{try{await captureSession.enable();$('status').textContent='圖片擷取已啟用，現在可以開始掃描。';}catch(e){$('status').textContent='無法啟用圖片擷取：'+e.message;}};
 window.addEventListener('pagehide',()=>captureSession.stop());
 launcher.onclick=()=>{host.style.display=host.style.display==='none'?'block':'none';};$('close').onclick=()=>host.style.display='none';
-const run=mode=>scanner.start({scope:$('scope').value,mode,from:$('from').value,to:$('to').value,captureImages:$('saveImages').checked}).catch(e=>$('status').textContent=e.message);
+async function finishDownload(job){await TeamsChatUtils.autoDownload(job,download);await checkpoints.save(job);}
+$('format').onchange=()=>GM_setValue(key+'-format',$('format').value||'zip');
+const run=mode=>{if(autoPending||loadingCheckpoint)return;return scanner.start({scope:$('scope').value,mode,from:$('from').value,to:$('to').value,captureImages:$('saveImages').checked,format:$('format').value||'zip'}).catch(e=>$('status').textContent=e.message);};
 $('start').onclick=()=>run('range');$('history').onclick=()=>run('history');$('stop').onclick=()=>scanner.stop();
-$('resume').onclick=async()=>{try{const job=scanner.job||await GM_getValue(key,null);await scanner.resume(job,{captureImages:$('saveImages').checked});}catch(e){$('status').textContent=e.message;}};
-async function download(type){try{const job=scanner.job||await GM_getValue(key,null);const blob=type==='zip'?await TeamsChatArchive.build(job,mediaStore):new Blob([TeamsChatFormats.format(job,type)],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`teams-chat-${new Date(job.created).toISOString().slice(0,10)}.${type}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),120000);}catch(e){$('status').textContent=e.message;}}
-$('download').onclick=()=>download($('format').value);
-let autoPending=false;
-async function autoRun(options,consumeHash=false){
- if(autoPending||scanner.running)return;autoPending=true;host.style.display='block';
+$('resume').onclick=async()=>{if(autoPending||loadingCheckpoint||scanner.running)return;try{const job=scanner.job||await checkpoints.load();await scanner.resume(job,{captureImages:$('saveImages').checked});}catch(e){$('status').textContent=e.message;}};
+async function download(type){try{const job=scanner.job||await checkpoints.load();const blob=type==='zip'?await TeamsChatArchive.build(job,mediaStore):new Blob([TeamsChatFormats.format(job,type)],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`teams-chat-${new Date(job.created).toISOString().slice(0,10)}.${type}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),120000);}catch(e){$('status').textContent=e.message;throw e;}}
+$('download').onclick=()=>download($('format').value||'zip');
+let autoPending=false,waitCancelled=false,loadingCheckpoint=true;
+$('stop').onclick=()=>{waitCancelled=true;scanner.stop();};
+$('discard').onclick=async()=>{waitCancelled=true;scanner.stop();if(scanner.running){$('status').textContent='停止中；停止後再按清除進度';return;}if(scanner.job)scanner.job.abandoned=true;await checkpoints.clear();scanner.job=null;$('status').textContent='已清除進度';};
+$('log').onclick=async()=>{const job=scanner.job||await checkpoints.load();const url=URL.createObjectURL(new Blob([JSON.stringify(job?.progressLog||[],null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='progress-log.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),120000);};
+async function interrupted(error){if(!scanner.running)return;try{await scanner.interrupt(error);}catch(e){$('status').textContent=e.message;}}
+// Teams page errors are unrelated to scanner failures; use scanner catches and watchdog.
+// SPA soft navigation usually does not fire pagehide. Browsers may cancel asynchronous
+// pagehide downloads; persisted snapshots are the fallback.
+window.addEventListener('pagehide',()=>void interrupted(Error('頁面離開，進度已保留')));
+
+async function autoRun(options,consumeHash=false,resumeJob=null){
+ if(autoPending||loadingCheckpoint||scanner.running)return;autoPending=true;waitCancelled=false;host.style.display='block';
  try{
   $('status').textContent='自動匯出：等待 Teams 聊天介面／登入…';
   const end=Date.now()+600000;
   while(true){
+   if(waitCancelled)return;
    if(Date.now()>end)throw Error('等待 Teams 聊天介面逾時');
    const profile=document.querySelector('[data-tid="me-control-avatar-trigger"]');
    if(profile?.getClientRects().length&&document.querySelector('[role="tree"],[data-tid="app-bar-wrapper"]')){try{await TeamsChatUtils.identify();break;}catch{}}
    await new Promise(r=>setTimeout(r,500));
   }
-  if(scanner.running)return;
-  if(consumeHash)history.replaceState(history.state,'',location.pathname+location.search);
-  $('scope').value='all';$('from').value=local(Date.parse(options.from));$('to').value=local(Date.parse(options.to));$('format').value=options.format;
+  if(scanner.running||waitCancelled)return;
+  $('scope').value='all';$('from').value=local(Date.parse(options.from));$('to').value=local(Date.parse(options.to));$('format').value=options.format||'zip';await GM_setValue(key+'-format',$('format').value);
+  if(consumeHash)history.replaceState(history.state,'',TeamsChatUtils.strippedURL(location));
   // Automatic runs use local DOM image capture; never request screen sharing here.
-  const previous=scanner.job;
-  try{await scanner.start({...options,captureImages:$('saveImages').checked});}
-  finally{if(options.autodownload&&scanner.job&&scanner.job!==previous)await download(options.format);}
- }catch(e){$('status').textContent=e.message;}finally{autoPending=false;}
+  if(resumeJob)await scanner.resume(resumeJob);else await scanner.start({...options,captureImages:$('saveImages').checked});
+ }catch(e){if(resumeJob){if(scanner.job?.id!==resumeJob.id)scanner.job=resumeJob;scanner.job.status='interrupted';scanner.job.error=e.message;TeamsChatUtils.logProgress(scanner.job,e);await finishDownload(scanner.job);}$('status').textContent=e.message;}finally{autoPending=false;if(!waitCancelled&&location.hash.includes('teams-export=all'))setTimeout(hashTrigger,500);}
 }
 function hashTrigger(){try{const options=TeamsChatUtils.parseAutoHash(location.hash);if(options)void autoRun(options,true);}catch(e){host.style.display='block';$('status').textContent=e.message;}}
 window.addEventListener('hashchange',hashTrigger);
+window.addEventListener('popstate',hashTrigger);
+setInterval(()=>{if(!autoPending&&!loadingCheckpoint&&!scanner.running&&!waitCancelled)hashTrigger();},1000);
 // Alt+Shift+E: previous weekday 07:00 Taipei through now, all chats, ZIP download.
 window.addEventListener('keydown',event=>{if(event.altKey&&event.shiftKey&&!event.ctrlKey&&!event.metaKey&&event.code==='KeyE'&&!event.repeat&&!event.isComposing){event.preventDefault();const r=TeamsChatUtils.defaultAutoRange();void autoRun({scope:'all',mode:'range',from:new Date(r.from).toISOString(),to:new Date(r.to).toISOString(),format:'zip',autodownload:true});}});
-hashTrigger();
+void (async()=>{try{$('format').value=await GM_getValue(key+'-format','zip')||'zip';const job=await checkpoints.load();loadingCheckpoint=false;if(TeamsChatUtils.resumable(job)){const options={...job,from:new Date(job.range.from).toISOString(),to:new Date(job.range.to).toISOString()};await autoRun(options,!!TeamsChatUtils.parseAutoHash(location.hash),job);}else hashTrigger();}catch(e){loadingCheckpoint=false;host.style.display='block';$('status').textContent=e.message;}})();
 })();

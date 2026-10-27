@@ -3,7 +3,7 @@ const root=path.resolve(__dirname,'..');
 const header=`// ==UserScript==
 // @name         Teams Chat Downloader (DOM local)
 // @namespace    https://github.com/rahulmasal/TeamsChatDownloader
-// @version      1.4.0
+// @version      1.4.2
 // @description  Local DOM-only chat export with date ranges, batching and checkpoints.
 // @author       Rahul Masal; local adaptation
 // @match        https://teams.microsoft.com/*
