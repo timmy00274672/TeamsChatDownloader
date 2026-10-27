@@ -2,16 +2,16 @@
 <html lang="zh-Hant">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Teams Chat Downloader</title><link rel="stylesheet" href="styles.css"></head>
 <body><div class="container">
-<header class="header"><div class="logo"><img src="icon48.png" alt="" width="28" height="28"><h1>Teams Chat Downloader</h1></div><span class="version">v1.2 DOM</span></header>
+<header class="header"><div class="logo"><img src="icon48.png" alt="" width="28" height="28"><h1>Teams Chat Downloader</h1></div><span class="version">v1.3 圖片</span></header>
 <div id="status" class="status"><span class="status-icon">💬</span><span class="status-text">正在確認 Teams 分頁…</span></div>
 <div class="controls">
 <label for="scope">範圍</label><select id="scope" class="scope-select"><option value="all">所有聊天（略過頻道）</option><option value="current">目前聊天</option></select>
 <label for="from">開始（台北時間，包含）</label><input id="from" type="datetime-local" step="1">
 <label for="to">結束（台北時間，不含）</label><input id="to" type="datetime-local" step="1">
-<div class="scan-options"><button id="scanBtn" class="btn btn-primary">掃描指定時段</button><button id="scanFullBtn" class="btn btn-outline">目前聊天全部歷史</button></div>
+<label><input type="checkbox" id="saveImages" checked> 保存圖片（ZIP 分開存檔）</label><p class="note">勾選圖片時請保持此 Teams 分頁在前景，圖片以已載入畫面存成 PNG。</p><div class="scan-options"><button id="scanBtn" class="btn btn-primary">掃描指定時段</button><button id="scanFullBtn" class="btn btn-outline">目前聊天全部歷史</button></div>
 <div class="action-row"><button id="scanVisibleBtn" class="btn btn-outline">目前已載入畫面</button><button id="resumeBtn" class="btn btn-outline">續抓</button><button id="stopBtn" class="btn btn-outline" disabled>停止</button></div>
 <p class="note">預設最近 24 小時。掃描期間請勿切換此分頁的聊天；可能將訊息標為已讀。關閉此面板可繼續掃描，重新整理 Teams 後需按續抓。</p>
-<div class="export-row"><select id="formatSelect" class="select" title="匯出格式"><option value="txt">純文字 TXT</option><option value="json">JSON</option><option value="csv">CSV</option><option value="html">HTML</option></select><button id="downloadBtn" class="btn btn-success" disabled>下載目前結果</button></div>
+<div class="export-row"><select id="formatSelect" class="select" title="匯出格式"><option value="zip">ZIP：TXT＋獨立圖片</option><option value="txt">純文字 TXT</option><option value="json">JSON</option><option value="csv">CSV</option><option value="html">HTML</option></select><button id="downloadBtn" class="btn btn-success" disabled>下載目前結果</button></div>
 </div><p class="note" id="activeRange"></p><div id="messageCount" class="message-count" hidden><span id="countText"></span></div><div id="messages" class="messages"></div>
 <footer class="footer"><span>資料儲存在本機擴充套件；不呼叫 Teams API</span></footer></div>
 <script src="export-formats.js"></script><script src="popup.js"></script></body></html>

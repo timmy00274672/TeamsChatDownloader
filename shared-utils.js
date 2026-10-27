@@ -57,10 +57,10 @@ function prepare(input={}){
  return {a,mode,scope,initial,range:makeRange(input)};
 }
 class Scanner{
- constructor({save=async()=>{},delay=900,maxSteps=2000,onUpdate=()=>{},loginTimeout=600000}={}){Object.assign(this,{save,delay,maxSteps,onUpdate,loginTimeout});this.job=null;this.running=false;this.cancelled=false;this.sequence=0;}
+ constructor({save=async()=>{},delay=900,maxSteps=2000,onUpdate=()=>{},loginTimeout=600000,captureProvider=null,mediaStore=null}={}){Object.assign(this,{save,delay,maxSteps,onUpdate,loginTimeout,captureProvider});this.mediaStore=mediaStore||(root.TeamsChatImages?new root.TeamsChatImages.MediaStore():null);this.job=null;this.running=false;this.cancelled=false;this.sequence=0;}
  check(){if(this.cancelled)throw stopped();}
  async wait(){this.check();await new Promise(r=>setTimeout(r,this.delay));this.check();}
- summary(){if(!this.job)return null;const j=this.job;return {id:j.id,status:j.status,stage:j.stage,range:j.range,scope:j.scope,mode:j.mode,account:j.account,conversations:j.conversations.map(c=>({key:c.key,name:c.name,status:c.status,count:this.selected(c).length,warnings:c.warnings,error:c.error})),count:j.conversations.reduce((n,c)=>n+this.selected(c).length,0),warnings:j.warnings,error:j.error,updated:j.updated};}
+ summary(){if(!this.job)return null;const j=this.job;return {id:j.id,status:j.status,stage:j.stage,range:j.range,scope:j.scope,mode:j.mode,account:j.account,conversations:j.conversations.map(c=>({key:c.key,name:c.name,status:c.status,count:this.selected(c).length,warnings:c.warnings,error:c.error})),count:j.conversations.reduce((n,c)=>n+this.selected(c).length,0),captureImages:j.captureImages,imageCount:j.conversations.reduce((n,c)=>n+this.selected(c).reduce((sum,m)=>sum+(m.images||[]).filter(i=>i.status==='saved').length,0),0),warnings:j.warnings,error:j.error,updated:j.updated};}
  async persist(){if(!this.job)return;this.job.updated=Date.now();this.onUpdate(this.summary());await this.save(this.job);}
  selected(c){return c.messages.filter(m=>m.timestamp===null || this.job.mode==='history'||(m.timestamp>=this.job.range.from&&m.timestamp<this.job.range.to));}
  async auth(){
@@ -72,19 +72,19 @@ class Scanner{
  async start(input={}){
   if(this.running)throw Error('已有掃描正在執行');
   this.running=true;this.cancelled=false;
-  let prepared;try{await identify();this.check();prepared=prepare(input);}catch(e){this.running=false;throw e;}
+  let prepared;try{await identify();this.check();prepared=prepare(input);if(input.captureImages&&!this.captureProvider)throw Error('請先啟用圖片擷取，並選擇此 Teams 分頁');}catch(e){this.running=false;throw e;}
   const {a,mode,scope,initial,range}=prepared;
   const conversations=initial.map(c=>this.newConversation(c));
-  this.job={version:2,id:crypto.randomUUID(),created:Date.now(),account:a,range,scope,mode,status:'running',stage:'準備中',discovery:{status:'pending'},warnings:['僅掃描網頁可列舉的聊天；隱藏／封存內容可能不在清單中。','所有頻道依需求排除。'],conversations};
+  this.job={version:2,id:crypto.randomUUID(),created:Date.now(),account:a,range,scope,mode,captureImages:!!input.captureImages,status:'running',stage:'準備中',discovery:{status:'pending'},warnings:['僅掃描網頁可列舉的聊天；隱藏／封存內容可能不在清單中。','所有頻道依需求排除。'],conversations};
   await this.execute();return this.job;
  }
  newConversation(c){return {...c,status:'pending',messages:[],warnings:[],traversal:{},attempts:0};}
- async resume(job){
+ async resume(job,options={}){
   if(this.running)throw Error('已有掃描正在執行');
   if(!job||job.version!==2)throw Error('沒有可續抓的工作');
   this.running=true;this.cancelled=false;
-  try{await identify();this.check();if(account()!==job.account)throw Error('目前登入帳號與進度不同');}catch(e){this.running=false;throw e;}
-  this.job=structuredClone(job);await this.execute();return this.job;
+  try{await identify();this.check();if(account()!==job.account)throw Error('目前登入帳號與進度不同');if((job.captureImages||options.captureImages)&&!this.captureProvider)throw Error('原工作需要圖片擷取，請啟用並選擇此 Teams 分頁後續抓');}catch(e){this.running=false;throw e;}
+  this.job=structuredClone(job);if(options.captureImages&&!this.job.captureImages){this.job.captureImages=true;for(const c of this.job.conversations)if(c.status==='complete')c.status='pending';}await this.execute();return this.job;
  }
  stop(){this.cancelled=true;}
  async rail(){
@@ -140,11 +140,31 @@ class Scanner{
    const identity=m.id?'id:'+m.id:'uncertain:'+this.job.id+':'+(++this.sequence);
    const converted={id:m.id,key:identity,sender:m.author||'作者不明',authorMissing:!m.author,timestamp:time,rawTime:m.rawTime,text:m.text,attachments:m.links||[],parent:m.parent,quote:m.quote,uncertainIdentity:!m.id};
    const old=c.messages.find(x=>x.key===identity);
+   converted.images=(m.images||[]).map(image=>{const prior=old?.images?.find(x=>x.index===image.index&&x.identity===image.identity&&x.url===image.url);return prior?{...image,...prior}:{...image,status:'link-only'};});
    if(old)Object.assign(old,converted);else c.messages.push(converted);
    if(m.truncated)c.warnings.push('部分訊息未展開全文');
    if(!m.id)c.warnings.push('部分訊息沒有穩定識別值，保留可能重複的紀錄');
   }
-  c.warnings=[...new Set(c.warnings)];await this.persist();return {raw,pane};
+  if(this.job.captureImages)await this.captureImages(c,raw);
+  c.warnings=[...new Set(c.warnings)];await this.persist();return {raw:readMessages(),pane:readPane()};
+ }
+ async captureImages(c,raw){
+  if(!root.TeamsChatImages||!this.mediaStore)throw Error('圖片模組尚未載入，請更新後重新整理');
+  for(const item of raw){
+   const m=item.id?c.messages.find(x=>x.id===item.id):c.messages.find(x=>x.text===item.text&&x.sender===(item.author||'作者不明'));
+   if(!m||!this.selected(c).includes(m))continue;
+   const body=document.getElementById('message-body-'+item.id);if(!body)continue;
+   const elements=root.TeamsChatImages.candidates(body);
+   for(const image of m.images||[]){
+    this.check();if(image.status==='saved')continue;
+    const e=elements[image.index];if(!e)continue;const r=e.getBoundingClientRect(),view=this.viewport().getBoundingClientRect();if(r.bottom<=view.top||r.top>=view.bottom)continue;
+    this.job.stage=`保存圖片：${c.name} / ${m.id||'未識別訊息'} / ${image.index+1}`;
+    const check=()=>{this.check();if(readPane().headerId!=='chat-header-'+c.key)throw Error('聊天已切換；停止以免混入其他聊天');};
+    try{check();const {blob,method}=await root.TeamsChatImages.capture(e,this.captureProvider,check);check();const file=await root.TeamsChatImages.filename(c.key,m.key,image.index);await this.mediaStore.put(this.job.id,file,blob);Object.assign(image,{file,status:'saved',method,bytes:blob.size,error:null});}
+    catch(error){Object.assign(image,{status:'failed',error:error.message});if(error.stopped||error.captureUnavailable||/已切換/.test(error.message))throw error;}
+    await this.persist();
+   }
+  }
  }
  viewport(){const e=matches(null,'[data-tid="message-pane-list-viewport"]')[0];if(!e)throw Error('找不到聊天捲動區');return e;}
  async scan(c){
@@ -168,6 +188,7 @@ class Scanner{
    if(stable>=4){c.traversal.lower='observed-stable-top';c.warnings.push('頂部已穩定，但沒有明確歷史起始標記，無法確認更早內容完整載入');break;}
    previous=signature;this.viewport().scrollTop-=this.viewport().clientHeight*.65;await this.wait();
   }
+  if(this.job.captureImages&&this.selected(c).some(m=>(m.images||[]).some(image=>image.status!=='saved')))c.warnings.push('部分圖片未保存，TXT 已保留連結與原因；可啟用圖片擷取後續抓');
   if(!bottom)c.warnings.push('未確認最新訊息的底部邊界');
   if(!lower&&!c.traversal.lower)c.warnings.push('尚未覆蓋開始時間，達到捲動上限');
   if(c.messages.some(m=>m.timestamp===null))c.warnings.push('部分紀錄缺少完整時間，未判定是否在範圍內');
@@ -188,7 +209,7 @@ class Scanner{
      try{
       if(this.job.scope==='all')await this.open(c);else if(current().key!==c.key)throw Error('請回到原本的聊天再續抓');
       await this.scan(c);c.error=null;break;
-     }catch(e){c.status='failed';c.error=e.message;await this.persist();if(e.stopped||/帳號|已切換|原本的聊天/.test(e.message))throw e;if(attempt<2)await this.wait();}
+     }catch(e){c.status='failed';c.error=e.message;await this.persist();if(e.stopped||e.captureUnavailable||/帳號|已切換|原本的聊天/.test(e.message))throw e;if(attempt<2)await this.wait();}
     }await this.persist();
    }
    this.job.status=this.job.discovery.status==='complete'&&this.job.conversations.length&&this.job.conversations.every(c=>c.status==='complete')?'complete':'partial';this.job.stage='掃描結束';await this.persist();

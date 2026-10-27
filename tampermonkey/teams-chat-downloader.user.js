@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Teams Chat Downloader (DOM local)
 // @namespace    https://github.com/rahulmasal/TeamsChatDownloader
-// @version      1.2.0
+// @version      1.3.0
 // @description  Local DOM-only chat export with date ranges, batching and checkpoints.
 // @author       Rahul Masal; local adaptation
 // @match        https://teams.microsoft.com/*
@@ -11,6 +11,73 @@
 // @grant        GM_getValue
 // @run-at       document-idle
 // ==/UserScript==
+
+/* Images already rendered by Teams: read canvas when permitted, otherwise crop a tab screenshot. No media requests. */
+(function(root){
+'use strict';
+const pngBlob=canvas=>new Promise((resolve,reject)=>{try{canvas.toBlob(b=>b?resolve(b):reject(Error('圖片轉換失敗')),'image/png');}catch(e){reject(e);}});
+const frame=()=>new Promise(resolve=>{const timer=setTimeout(resolve,500);requestAnimationFrame(()=>requestAnimationFrame(()=>{clearTimeout(timer);resolve();}));});
+const unavailable=message=>Object.assign(Error(message),{captureUnavailable:true});
+function candidates(body){return [...(body.querySelector('[data-message-content]')||body).querySelectorAll('img')].filter(e=>{
+ const r=e.getBoundingClientRect();return !e.closest('[itemtype*="Emoji"],[data-tid*="emoji"],.emojione,[data-is-emoji="true"]')&&(r.width>=32&&r.height>=32||e.naturalWidth>=64&&e.naturalHeight>=64);
+});}
+function describe(e,index){const source=e.currentSrc||e.src||'';let digest=2166136261;for(let i=0;i<source.length;i++)digest=Math.imul(digest^source.charCodeAt(i),16777619);return {index,identity:e.id||((source.startsWith('data:')?'data-image:'+String(digest>>>0):source)||String(index)),alt:e.alt||e.getAttribute('aria-label')||'圖片',url:/^(https?:|blob:)/.test(e.currentSrc||e.src)?e.currentSrc||e.src:null};}
+class MediaStore{
+ async db(){if(!this.connection)this.connection=await new Promise((resolve,reject)=>{const request=indexedDB.open('teams-chat-downloader-local-media-v1',1);request.onupgradeneeded=()=>request.result.createObjectStore('images');request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);});return this.connection;}
+ async transaction(mode,action){const db=await this.db();return new Promise((resolve,reject)=>{const tx=db.transaction('images',mode),request=action(tx.objectStore('images'));tx.oncomplete=()=>resolve(request.result??null);tx.onerror=()=>reject(tx.error||Error('圖片儲存失敗'));tx.onabort=()=>reject(tx.error||Error('圖片儲存中斷'));});}
+ async put(job,file,blob){await this.transaction('readwrite',s=>s.put(blob,job+':'+file));}
+ async get(job,file){return this.transaction('readonly',s=>s.get(job+':'+file));}
+}
+async function filename(chat,message,index){const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(chat+'\0'+message));const prefix=[...new Uint8Array(bytes)].slice(0,10).map(x=>x.toString(16).padStart(2,'0')).join('');return `images/${prefix}_${index+1}.png`;}
+function cropRect(e){
+ let r=e.getBoundingClientRect(),left=0,top=0,right=innerWidth,bottom=innerHeight;
+ for(let p=e.parentElement;p;p=p.parentElement){const css=getComputedStyle(p),b=p.getBoundingClientRect();if(/auto|scroll|hidden|clip/.test(css.overflowX)){left=Math.max(left,b.left);right=Math.min(right,b.right);}if(/auto|scroll|hidden|clip/.test(css.overflowY)){top=Math.max(top,b.top);bottom=Math.min(bottom,b.bottom);}}
+ if(r.width<1||r.height<1||r.left<left-1||r.top<top-1||r.right>right+1||r.bottom>bottom+1)throw Error('圖片未完整顯示，已保留來源連結');
+ for(const [x,y]of [[r.left+2,r.top+2],[r.right-2,r.top+2],[r.left+2,r.bottom-2],[r.right-2,r.bottom-2],[(r.left+r.right)/2,(r.top+r.bottom)/2]]){const hit=document.elementFromPoint(x,y);if(!hit||!(hit===e||hit.contains(e)))throw Error('圖片被其他面板遮住，已保留連結');}
+ return {x:Math.max(0,r.left),y:Math.max(0,r.top),width:r.width,height:r.height,viewWidth:innerWidth,viewHeight:innerHeight};
+}
+async function capture(e,provider,check=()=>{}){
+ check();if(!e.isConnected)throw Error('圖片已離開頁面，請續抓重試');
+ if(!e.complete||!e.naturalWidth){await Promise.race([new Promise(resolve=>{e.addEventListener('load',resolve,{once:true});e.addEventListener('error',resolve,{once:true});}),new Promise(r=>setTimeout(r,2500))]);}
+ check();if(!e.complete||!e.naturalWidth)throw Error('圖片尚未載入，已保留連結');
+ if(e.naturalWidth*e.naturalHeight<=24000000){try{const canvas=document.createElement('canvas');canvas.width=e.naturalWidth;canvas.height=e.naturalHeight;canvas.getContext('2d').drawImage(e,0,0);return {blob:await pngBlob(canvas),method:'rendered-canvas'};}catch{/* Cross-origin pixels require a user-authorized tab capture. */}}
+ if(!provider?.capture)throw unavailable('圖片擷取未啟用，請先啟用再續抓');
+ const scrollers=[];for(let p=e.parentElement;p;p=p.parentElement)if(p.scrollHeight>p.clientHeight||p.scrollWidth>p.clientWidth)scrollers.push([p,p.scrollTop,p.scrollLeft]);
+ const originalStyle=e.getAttribute('style'),originalWindow=[scrollX,scrollY];
+ try{
+  e.style.setProperty('max-width',Math.floor(innerWidth*.65)+'px','important');e.style.setProperty('max-height',Math.floor(innerHeight*.45)+'px','important');e.style.setProperty('width','auto','important');e.style.setProperty('height','auto','important');e.style.setProperty('object-fit','contain','important');
+  e.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});await frame();await new Promise(r=>setTimeout(r,150));check();if(!e.isConnected)throw Error('捲動時圖片被回收，請續抓重試');
+  const blob=await provider.capture(()=>{check();return cropRect(e);});check();return {blob,method:'tab-screenshot'};
+ }finally{if(originalStyle===null)e.removeAttribute('style');else e.setAttribute('style',originalStyle);for(const [p,top,left]of scrollers){p.scrollTop=top;p.scrollLeft=left;}window.scrollTo(...originalWindow);await frame();}
+}
+class TabCapture{
+ constructor({hide=()=>()=>{},onState=()=>{}}={}){Object.assign(this,{hide,onState});this.stream=null;this.video=null;this.marker=null;}
+ get ready(){return !!this.stream?.getVideoTracks().some(t=>t.readyState==='live');}
+ async enable(){
+  this.stop();if(!navigator.mediaDevices?.getDisplayMedia||!root.CropTarget?.fromElement)throw Error('此 Chrome 不支援分頁圖片擷取，請改用擴充套件');
+  // Called only by a direct click on the enable button: Chrome presents its own tab picker.
+  const stream=await navigator.mediaDevices.getDisplayMedia({video:{displaySurface:'browser',frameRate:10},audio:false,preferCurrentTab:true,selfBrowserSurface:'include'});
+  try{const track=stream.getVideoTracks()[0];if(track.getSettings().displaySurface!=='browser'||!track.cropTo)throw Error('請只選目前的 Teams 瀏覽器分頁，不要選整個螢幕或視窗');
+   // A CropTarget from this document must belong to the captured tab. A different tab rejects.
+   this.marker=document.createElement('div');this.marker.setAttribute('aria-hidden','true');this.marker.style.cssText='position:fixed;inset:0;pointer-events:none;background:transparent;z-index:-2147483647';document.documentElement.append(this.marker);const target=await CropTarget.fromElement(this.marker);await track.cropTo(target);
+   this.stream=stream;this.video=document.createElement('video');this.video.muted=true;this.video.playsInline=true;this.video.srcObject=stream;await this.video.play();track.addEventListener('ended',()=>this.stop(),{once:true});this.onState(true);
+  }catch(e){for(const t of stream.getTracks())t.stop();this.stream=null;this.video=null;this.marker?.remove();this.marker=null;throw e;}
+ }
+ stop(){this.marker?.remove();this.marker=null;const stream=this.stream;this.stream=null;for(const t of stream?.getTracks()||[])t.stop();if(this.video){this.video.pause();this.video.srcObject=null;this.video=null;}this.onState(false);}
+ async capture(rectangle){
+  if(!this.ready)throw unavailable('此圖片受網頁限制，請按「啟用圖片擷取」、選擇此 Teams 分頁後續抓；文字進度已保存');
+  const restore=this.hide();
+  try{await frame();const video=this.video;if(!video)throw unavailable('圖片擷取已停止');
+   await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(unavailable('沒有收到新的分頁畫面，請重新啟用圖片擷取')),5000);video.requestVideoFrameCallback(()=>{clearTimeout(timer);resolve();});});
+   const r=rectangle(),sx=video.videoWidth/r.viewWidth,sy=video.videoHeight/r.viewHeight;if(!sx||!sy)throw unavailable('分頁影像尚未就緒');
+   const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(r.width*sx));canvas.height=Math.max(1,Math.round(r.height*sy));canvas.getContext('2d').drawImage(video,r.x*sx,r.y*sy,r.width*sx,r.height*sy,0,0,canvas.width,canvas.height);return pngBlob(canvas);
+  }finally{restore();}
+ }
+}
+function blobFromDataURL(data){const raw=atob(data.split(',')[1]),bytes=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);return new Blob([bytes],{type:'image/png'});}
+function extensionCapture(){return {ready:true,async capture(rectangle){const r=await chrome.runtime.sendMessage({action:'capture-image',rect:rectangle()});if(!r?.ok)throw unavailable(r?.error||'無法擷取圖片，請保持 Teams 分頁在前景並重新點擴充套件');return blobFromDataURL(r.dataURL);}};}
+root.TeamsChatImages={MediaStore,TabCapture,candidates,describe,filename,capture,extensionCapture,blobFromDataURL};
+})(globalThis);
 
 /* Rendered-DOM readers for the local Teams build. */
 (function(root){
@@ -37,6 +104,7 @@ function readMessages() {
     return {id: id || null, author: author?.innerText?.trim() || null, rawTime: time?.getAttribute('datetime') || time?.getAttribute('aria-label') || time?.textContent || null,
       time: time?.getAttribute('datetime') || null,
       text: [content?.innerText?.trim() || '', ...images.map(x=>'[圖片：'+x+']')].filter(Boolean).join('\n') || body.innerText.trim(),
+      images: root.TeamsChatImages ? root.TeamsChatImages.candidates(body).map(root.TeamsChatImages.describe) : [],
       links, parent, quote: quote?.getAttribute('aria-label') || quote?.innerText || null, index,
       truncated: [...body.querySelectorAll('button')].some(b=>visible(b) && /^(see more|read more|show more|顯示更多|查看更多|閱讀更多|展开|展開)$/i.test((b.innerText || b.getAttribute('aria-label') || '').trim()))};
   });
@@ -134,10 +202,10 @@ function prepare(input={}){
  return {a,mode,scope,initial,range:makeRange(input)};
 }
 class Scanner{
- constructor({save=async()=>{},delay=900,maxSteps=2000,onUpdate=()=>{},loginTimeout=600000}={}){Object.assign(this,{save,delay,maxSteps,onUpdate,loginTimeout});this.job=null;this.running=false;this.cancelled=false;this.sequence=0;}
+ constructor({save=async()=>{},delay=900,maxSteps=2000,onUpdate=()=>{},loginTimeout=600000,captureProvider=null,mediaStore=null}={}){Object.assign(this,{save,delay,maxSteps,onUpdate,loginTimeout,captureProvider});this.mediaStore=mediaStore||(root.TeamsChatImages?new root.TeamsChatImages.MediaStore():null);this.job=null;this.running=false;this.cancelled=false;this.sequence=0;}
  check(){if(this.cancelled)throw stopped();}
  async wait(){this.check();await new Promise(r=>setTimeout(r,this.delay));this.check();}
- summary(){if(!this.job)return null;const j=this.job;return {id:j.id,status:j.status,stage:j.stage,range:j.range,scope:j.scope,mode:j.mode,account:j.account,conversations:j.conversations.map(c=>({key:c.key,name:c.name,status:c.status,count:this.selected(c).length,warnings:c.warnings,error:c.error})),count:j.conversations.reduce((n,c)=>n+this.selected(c).length,0),warnings:j.warnings,error:j.error,updated:j.updated};}
+ summary(){if(!this.job)return null;const j=this.job;return {id:j.id,status:j.status,stage:j.stage,range:j.range,scope:j.scope,mode:j.mode,account:j.account,conversations:j.conversations.map(c=>({key:c.key,name:c.name,status:c.status,count:this.selected(c).length,warnings:c.warnings,error:c.error})),count:j.conversations.reduce((n,c)=>n+this.selected(c).length,0),captureImages:j.captureImages,imageCount:j.conversations.reduce((n,c)=>n+this.selected(c).reduce((sum,m)=>sum+(m.images||[]).filter(i=>i.status==='saved').length,0),0),warnings:j.warnings,error:j.error,updated:j.updated};}
  async persist(){if(!this.job)return;this.job.updated=Date.now();this.onUpdate(this.summary());await this.save(this.job);}
  selected(c){return c.messages.filter(m=>m.timestamp===null || this.job.mode==='history'||(m.timestamp>=this.job.range.from&&m.timestamp<this.job.range.to));}
  async auth(){
@@ -149,19 +217,19 @@ class Scanner{
  async start(input={}){
   if(this.running)throw Error('已有掃描正在執行');
   this.running=true;this.cancelled=false;
-  let prepared;try{await identify();this.check();prepared=prepare(input);}catch(e){this.running=false;throw e;}
+  let prepared;try{await identify();this.check();prepared=prepare(input);if(input.captureImages&&!this.captureProvider)throw Error('請先啟用圖片擷取，並選擇此 Teams 分頁');}catch(e){this.running=false;throw e;}
   const {a,mode,scope,initial,range}=prepared;
   const conversations=initial.map(c=>this.newConversation(c));
-  this.job={version:2,id:crypto.randomUUID(),created:Date.now(),account:a,range,scope,mode,status:'running',stage:'準備中',discovery:{status:'pending'},warnings:['僅掃描網頁可列舉的聊天；隱藏／封存內容可能不在清單中。','所有頻道依需求排除。'],conversations};
+  this.job={version:2,id:crypto.randomUUID(),created:Date.now(),account:a,range,scope,mode,captureImages:!!input.captureImages,status:'running',stage:'準備中',discovery:{status:'pending'},warnings:['僅掃描網頁可列舉的聊天；隱藏／封存內容可能不在清單中。','所有頻道依需求排除。'],conversations};
   await this.execute();return this.job;
  }
  newConversation(c){return {...c,status:'pending',messages:[],warnings:[],traversal:{},attempts:0};}
- async resume(job){
+ async resume(job,options={}){
   if(this.running)throw Error('已有掃描正在執行');
   if(!job||job.version!==2)throw Error('沒有可續抓的工作');
   this.running=true;this.cancelled=false;
-  try{await identify();this.check();if(account()!==job.account)throw Error('目前登入帳號與進度不同');}catch(e){this.running=false;throw e;}
-  this.job=structuredClone(job);await this.execute();return this.job;
+  try{await identify();this.check();if(account()!==job.account)throw Error('目前登入帳號與進度不同');if((job.captureImages||options.captureImages)&&!this.captureProvider)throw Error('原工作需要圖片擷取，請啟用並選擇此 Teams 分頁後續抓');}catch(e){this.running=false;throw e;}
+  this.job=structuredClone(job);if(options.captureImages&&!this.job.captureImages){this.job.captureImages=true;for(const c of this.job.conversations)if(c.status==='complete')c.status='pending';}await this.execute();return this.job;
  }
  stop(){this.cancelled=true;}
  async rail(){
@@ -217,11 +285,31 @@ class Scanner{
    const identity=m.id?'id:'+m.id:'uncertain:'+this.job.id+':'+(++this.sequence);
    const converted={id:m.id,key:identity,sender:m.author||'作者不明',authorMissing:!m.author,timestamp:time,rawTime:m.rawTime,text:m.text,attachments:m.links||[],parent:m.parent,quote:m.quote,uncertainIdentity:!m.id};
    const old=c.messages.find(x=>x.key===identity);
+   converted.images=(m.images||[]).map(image=>{const prior=old?.images?.find(x=>x.index===image.index&&x.identity===image.identity&&x.url===image.url);return prior?{...image,...prior}:{...image,status:'link-only'};});
    if(old)Object.assign(old,converted);else c.messages.push(converted);
    if(m.truncated)c.warnings.push('部分訊息未展開全文');
    if(!m.id)c.warnings.push('部分訊息沒有穩定識別值，保留可能重複的紀錄');
   }
-  c.warnings=[...new Set(c.warnings)];await this.persist();return {raw,pane};
+  if(this.job.captureImages)await this.captureImages(c,raw);
+  c.warnings=[...new Set(c.warnings)];await this.persist();return {raw:readMessages(),pane:readPane()};
+ }
+ async captureImages(c,raw){
+  if(!root.TeamsChatImages||!this.mediaStore)throw Error('圖片模組尚未載入，請更新後重新整理');
+  for(const item of raw){
+   const m=item.id?c.messages.find(x=>x.id===item.id):c.messages.find(x=>x.text===item.text&&x.sender===(item.author||'作者不明'));
+   if(!m||!this.selected(c).includes(m))continue;
+   const body=document.getElementById('message-body-'+item.id);if(!body)continue;
+   const elements=root.TeamsChatImages.candidates(body);
+   for(const image of m.images||[]){
+    this.check();if(image.status==='saved')continue;
+    const e=elements[image.index];if(!e)continue;const r=e.getBoundingClientRect(),view=this.viewport().getBoundingClientRect();if(r.bottom<=view.top||r.top>=view.bottom)continue;
+    this.job.stage=`保存圖片：${c.name} / ${m.id||'未識別訊息'} / ${image.index+1}`;
+    const check=()=>{this.check();if(readPane().headerId!=='chat-header-'+c.key)throw Error('聊天已切換；停止以免混入其他聊天');};
+    try{check();const {blob,method}=await root.TeamsChatImages.capture(e,this.captureProvider,check);check();const file=await root.TeamsChatImages.filename(c.key,m.key,image.index);await this.mediaStore.put(this.job.id,file,blob);Object.assign(image,{file,status:'saved',method,bytes:blob.size,error:null});}
+    catch(error){Object.assign(image,{status:'failed',error:error.message});if(error.stopped||error.captureUnavailable||/已切換/.test(error.message))throw error;}
+    await this.persist();
+   }
+  }
  }
  viewport(){const e=matches(null,'[data-tid="message-pane-list-viewport"]')[0];if(!e)throw Error('找不到聊天捲動區');return e;}
  async scan(c){
@@ -245,6 +333,7 @@ class Scanner{
    if(stable>=4){c.traversal.lower='observed-stable-top';c.warnings.push('頂部已穩定，但沒有明確歷史起始標記，無法確認更早內容完整載入');break;}
    previous=signature;this.viewport().scrollTop-=this.viewport().clientHeight*.65;await this.wait();
   }
+  if(this.job.captureImages&&this.selected(c).some(m=>(m.images||[]).some(image=>image.status!=='saved')))c.warnings.push('部分圖片未保存，TXT 已保留連結與原因；可啟用圖片擷取後續抓');
   if(!bottom)c.warnings.push('未確認最新訊息的底部邊界');
   if(!lower&&!c.traversal.lower)c.warnings.push('尚未覆蓋開始時間，達到捲動上限');
   if(c.messages.some(m=>m.timestamp===null))c.warnings.push('部分紀錄缺少完整時間，未判定是否在範圍內');
@@ -265,7 +354,7 @@ class Scanner{
      try{
       if(this.job.scope==='all')await this.open(c);else if(current().key!==c.key)throw Error('請回到原本的聊天再續抓');
       await this.scan(c);c.error=null;break;
-     }catch(e){c.status='failed';c.error=e.message;await this.persist();if(e.stopped||/帳號|已切換|原本的聊天/.test(e.message))throw e;if(attempt<2)await this.wait();}
+     }catch(e){c.status='failed';c.error=e.message;await this.persist();if(e.stopped||e.captureUnavailable||/帳號|已切換|原本的聊天/.test(e.message))throw e;if(attempt<2)await this.wait();}
     }await this.persist();
    }
    this.job.status=this.job.discovery.status==='complete'&&this.job.conversations.length&&this.job.conversations.every(c=>c.status==='complete')?'complete':'partial';this.job.stage='掃描結束';await this.persist();
@@ -293,6 +382,7 @@ function text(job){
    if(m.parent)lines.push('回覆目標：'+m.parent);else if(m.quote)lines.push('引用原文：'+m.quote);
    if(m.timestamp===null)lines.push('[時間不明：未判定是否位於範圍內] 原始時間：'+(m.rawTime||'頁面未提供'));
    if(m.uncertainIdentity)lines.push('[識別不確定，可能重複]');
+   for(const image of m.images||[]){if(image.status==='saved'&&image.file)lines.push('圖片檔案：'+image.file);else lines.push('圖片未保存：'+(image.error||'尚未擷取'));if(image.url)lines.push('圖片連結：'+image.url);}
    for(const a of m.attachments||[])lines.push('連結／附件：'+(a.text||'')+' '+(a.url||''));lines.push('');
   }
  }return lines.join('\n');
@@ -308,6 +398,39 @@ function format(job,type){if(!job)throw Error('尚無匯出資料');switch(type)
 root.TeamsChatFormats={format,exportObject,time};
 })(globalThis);
 
+/* Small ZIP writer (stored entries, UTF-8 names, CRC32). No network or third-party runtime. */
+(function(root){
+'use strict';
+const table=Array.from({length:256},(_,n)=>{for(let i=0;i<8;i++)n=n&1?0xedb88320^(n>>>1):n>>>1;return n>>>0;});
+const crc=bytes=>{let c=0xffffffff;for(const b of bytes)c=table[(c^b)&255]^(c>>>8);return (c^0xffffffff)>>>0;};
+function header(size){const bytes=new Uint8Array(size),view=new DataView(bytes.buffer);return {bytes,u16:(p,n)=>view.setUint16(p,n,true),u32:(p,n)=>view.setUint32(p,n,true)};}
+async function zip(entries){
+ const chunks=[],central=[];let offset=0,centralSize=0;
+ if(entries.length>65535)throw Error('檔案數超過 ZIP 上限，請縮小匯出時間範圍');
+ for(const {name,data}of entries){if(!name||name.startsWith('/')||name.split('/').includes('..'))throw Error('無效 ZIP 檔名');
+  const filename=new TextEncoder().encode(name),bytes=data instanceof Blob?new Uint8Array(await data.arrayBuffer()):new TextEncoder().encode(String(data));if(filename.length>65535||bytes.length>0xffffffff||offset+bytes.length+filename.length+30>0xffffffff)throw Error('ZIP 超過 4GB，請縮小時間範圍');
+  const checksum=crc(bytes),local=header(30);local.u32(0,0x04034b50);local.u16(4,20);local.u16(6,0x800);local.u16(12,33);local.u32(14,checksum);local.u32(18,bytes.length);local.u32(22,bytes.length);local.u16(26,filename.length);
+  chunks.push(local.bytes,filename,bytes);
+  const dir=header(46);dir.u32(0,0x02014b50);dir.u16(4,20);dir.u16(6,20);dir.u16(8,0x800);dir.u16(14,33);dir.u32(16,checksum);dir.u32(20,bytes.length);dir.u32(24,bytes.length);dir.u16(28,filename.length);dir.u32(42,offset);central.push(dir.bytes,filename);centralSize+=46+filename.length;offset+=30+filename.length+bytes.length;
+ }
+ const end=header(22);end.u32(0,0x06054b50);end.u16(8,entries.length);end.u16(10,entries.length);end.u32(12,centralSize);end.u32(16,offset);return new Blob([...chunks,...central,end.bytes],{type:'application/zip'});
+}
+async function build(job,store){
+ const j=structuredClone(root.TeamsChatFormats.exportObject(job)),entries=[],seen=new Set();let saved=0,missing=0;
+ if(!j.captureImages)j.warnings.push('此工作未啟用圖片保存；ZIP 只包含文字與原有連結。若需圖片，請啟用圖片擷取後按續抓或重新掃描。');
+ for(const c of j.conversations)for(const m of c.messages)for(const image of m.images||[]){
+  if(image.status==='saved'&&image.file&&!seen.has(image.file)){
+   const blob=await store.get(j.id,image.file);if(blob){entries.push({name:image.file,data:blob});seen.add(image.file);saved++;}
+   else{image.status='missing';image.error='本機圖片快取已不存在，需啟用圖片後重新掃描';missing++;c.status='partial';}
+  }else if(image.status!=='saved'&&j.captureImages)missing++;
+ }
+ j.imageReport={saved,missing};if(missing){j.status='partial';j.warnings.push(`${missing} 張圖片未保存，請查看各訊息的圖片連結與原因。`);}
+ entries.unshift({name:'chat.txt',data:root.TeamsChatFormats.format(j,'txt')},{name:'report.json',data:JSON.stringify(j,null,2)});
+ return zip(entries);
+}
+root.TeamsChatArchive={zip,build};
+})(globalThis);
+
 /* Standalone local userscript panel. Checkpoints use this userscript's GM storage only. */
 (function(){
 'use strict';
@@ -315,23 +438,29 @@ const key='teams-dom-export-v2';
 const launcher=document.createElement('button');launcher.textContent='Teams 匯出';launcher.style.cssText='position:fixed;right:16px;bottom:18px;z-index:2147483646;padding:10px;border-radius:8px;background:#6264a7;color:white;border:0;cursor:pointer';document.documentElement.append(launcher);
 const host=document.createElement('div');host.style.cssText='position:fixed;right:16px;top:80px;z-index:2147483647;width:360px;max-height:80vh;overflow:auto;display:none';document.documentElement.append(host);const shadow=host.attachShadow({mode:'open'});
 function node(tag,attrs={},...children){const e=document.createElement(tag);for(const [k,v]of Object.entries(attrs))e.setAttribute(k,v);for(const c of children)e.append(typeof c==='string'?document.createTextNode(c):c);return e;}
-const style=node('style',{},':host{font:14px system-ui;color:#eee}section{padding:18px;background:#20202c;border:1px solid #777;border-radius:12px}input,select,button{box-sizing:border-box;font:inherit;padding:7px;margin:5px 0;width:100%}p{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#bbb}');
+const style=node('style',{},':host{font:14px system-ui;color:#eee}section{padding:18px;background:#20202c;border:1px solid #777;border-radius:12px}input[type=checkbox]{width:auto}input,select,button{box-sizing:border-box;font:inherit;padding:7px;margin:5px 0;width:100%}p{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#bbb}');
 shadow.append(style,node('section',{},
  node('button',{id:'close'},'關閉面板（掃描繼續）'),node('h3',{},'Teams Chat Downloader · DOM'),
  node('label',{},'範圍',node('select',{id:'scope'},node('option',{value:'all'},'所有聊天（略過頻道）'),node('option',{value:'current'},'目前聊天'))),
  node('label',{},'開始（台北時間）',node('input',{id:'from',type:'datetime-local',step:'1'})),
  node('label',{},'結束（不含）',node('input',{id:'to',type:'datetime-local',step:'1'})),
+ node('label',{},node('input',{id:'saveImages',type:'checkbox',checked:''}),' 保存圖片（ZIP 分開存檔）'),node('button',{id:'enableImages'},'啟用圖片擷取（需要時）'),
+ node('small',{},'可以先直接掃描。若提示圖片受限制，再啟用擷取並選此 Teams 分頁。圖片僅存本機 PNG，不上傳。'),
  node('button',{id:'start'},'掃描指定時段'),node('button',{id:'history'},'目前聊天全部歷史'),node('button',{id:'resume'},'續抓本機進度'),node('button',{id:'stop'},'停止'),
- node('label',{},'格式',node('select',{id:'format'},...['txt','json','csv','html'].map(t=>node('option',{},t)))),
+ node('label',{},'格式',node('select',{id:'format'},...['zip','txt','json','csv','html'].map(t=>node('option',{},t)))),
  node('button',{id:'download'},'下載目前結果'),node('p',{id:'status'},'預設最近 24 小時'),
  node('small',{},'掃描可能將聊天標為已讀。請勿切換此分頁的聊天；重新整理後可續抓。資料只存於本機 userscript 儲存空間。')
 ));
 const $=id=>shadow.getElementById(id),local=t=>new Date(t+28800000).toISOString().slice(0,19);
 $('from').value=local(Date.now()-86400000);$('to').value=local(Date.now());
-const scanner=new TeamsChatUtils.Scanner({save:job=>GM_setValue(key,job),onUpdate:s=>{$('status').textContent=`${s.status}：${s.stage}\n${s.conversations.length} 個聊天，${s.count} 則\n${s.error||''}`;for(const id of ['start','history','resume'])$(id).disabled=scanner.running;}});
+const mediaStore=new TeamsChatImages.MediaStore();
+const captureSession=new TeamsChatImages.TabCapture({hide:()=>{const previous=[host.style.visibility,launcher.style.visibility];host.style.visibility='hidden';launcher.style.visibility='hidden';return ()=>{host.style.visibility=previous[0];launcher.style.visibility=previous[1];};},onState:ready=>{$('enableImages').textContent=ready?'圖片擷取已啟用':'啟用圖片擷取（需要時）';}});
+const scanner=new TeamsChatUtils.Scanner({mediaStore,captureProvider:captureSession,save:job=>GM_setValue(key,job),onUpdate:s=>{$('status').textContent=`${s.status}：${s.stage}\n${s.conversations.length} 個聊天，${s.count} 則，已保存圖片 ${s.imageCount||0} 張\n${s.error||''}`;for(const id of ['start','history','resume','enableImages','saveImages'])$(id).disabled=scanner.running;if(!scanner.running)captureSession.stop();}});
+$('enableImages').onclick=async()=>{try{await captureSession.enable();$('status').textContent='圖片擷取已啟用，現在可以開始掃描。';}catch(e){$('status').textContent='無法啟用圖片擷取：'+e.message;}};
+window.addEventListener('pagehide',()=>captureSession.stop());
 launcher.onclick=()=>{host.style.display=host.style.display==='none'?'block':'none';};$('close').onclick=()=>host.style.display='none';
-const run=mode=>scanner.start({scope:$('scope').value,mode,from:$('from').value,to:$('to').value}).catch(e=>$('status').textContent=e.message);
+const run=mode=>scanner.start({scope:$('scope').value,mode,from:$('from').value,to:$('to').value,captureImages:$('saveImages').checked}).catch(e=>$('status').textContent=e.message);
 $('start').onclick=()=>run('range');$('history').onclick=()=>run('history');$('stop').onclick=()=>scanner.stop();
-$('resume').onclick=async()=>{try{const job=scanner.job||await GM_getValue(key,null);await scanner.resume(job);}catch(e){$('status').textContent=e.message;}};
-$('download').onclick=async()=>{try{const job=scanner.job||await GM_getValue(key,null),type=$('format').value;const blob=new Blob([TeamsChatFormats.format(job,type)],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`teams-chat-${new Date(job.created).toISOString().slice(0,10)}.${type}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);}catch(e){$('status').textContent=e.message;}};
+$('resume').onclick=async()=>{try{const job=scanner.job||await GM_getValue(key,null);await scanner.resume(job,{captureImages:$('saveImages').checked});}catch(e){$('status').textContent=e.message;}};
+$('download').onclick=async()=>{try{const job=scanner.job||await GM_getValue(key,null),type=$('format').value;const blob=type==='zip'?await TeamsChatArchive.build(job,mediaStore):new Blob([TeamsChatFormats.format(job,type)],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`teams-chat-${new Date(job.created).toISOString().slice(0,10)}.${type}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),120000);}catch(e){$('status').textContent=e.message;}};
 })();

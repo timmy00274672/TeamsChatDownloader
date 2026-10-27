@@ -15,6 +15,7 @@ function text(job){
    if(m.parent)lines.push('回覆目標：'+m.parent);else if(m.quote)lines.push('引用原文：'+m.quote);
    if(m.timestamp===null)lines.push('[時間不明：未判定是否位於範圍內] 原始時間：'+(m.rawTime||'頁面未提供'));
    if(m.uncertainIdentity)lines.push('[識別不確定，可能重複]');
+   for(const image of m.images||[]){if(image.status==='saved'&&image.file)lines.push('圖片檔案：'+image.file);else lines.push('圖片未保存：'+(image.error||'尚未擷取'));if(image.url)lines.push('圖片連結：'+image.url);}
    for(const a of m.attachments||[])lines.push('連結／附件：'+(a.text||'')+' '+(a.url||''));lines.push('');
   }
  }return lines.join('\n');

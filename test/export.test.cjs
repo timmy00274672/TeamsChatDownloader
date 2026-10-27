@@ -1,5 +1,5 @@
 const {test}=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs');const path=require('node:path');const {chromium}=require('playwright');
-const root=path.resolve(__dirname,'..'),sources=['dom.js','shared-utils.js','export-formats.js'];
+const root=path.resolve(__dirname,'..'),sources=['images.js','dom.js','shared-utils.js','export-formats.js','archive.js'];
 const key='19:fixture@thread.v2',other='19:second@thread.v2';
 const msg=(id,t,text='相同內容')=>`<div><span id="author-${id}">測試作者</span><time id="timestamp-${id}" datetime="${t}"></time><div id="message-body-${id}" data-mid="${id}"><div id="content-${id}">${text}</div></div></div>`;
 const row=(key,name,muted=false)=>`<div tabindex="0" role="treeitem" data-item-type="${muted?'muted-chat':'chat'}" data-fui-tree-item-value="chat|${key}"><span id="title-chat-list-item_${key}">${name}</span></div>`;
@@ -48,7 +48,7 @@ test('停止、帳號切換與存檔失敗都保留可辨識的狀態',async()=>
 });
 
 test('打包權限、共用引擎與無遠端讀取',()=>{
- const manifest=JSON.parse(fs.readFileSync(path.join(root,'manifest.json')));assert.ok(manifest.host_permissions.includes('https://teams.cloud.microsoft/*'));assert.equal(manifest.content_scripts[0].js.join(','),'dom.js,shared-utils.js,content.js');
+ const manifest=JSON.parse(fs.readFileSync(path.join(root,'manifest.json')));assert.ok(manifest.host_permissions.includes('https://teams.cloud.microsoft/*'));assert.equal(manifest.content_scripts[0].js.join(','),'images.js,dom.js,shared-utils.js,export-formats.js,archive.js,content.js');
  for(const file of ['shared-utils.js','dom.js','content.js','export-formats.js'])assert.doesNotMatch(fs.readFileSync(path.join(root,file),'utf8'),/\b(?:fetch|XMLHttpRequest|WebSocket)\s*\(/);
  const user=fs.readFileSync(path.join(root,'tampermonkey/teams-chat-downloader.user.js'),'utf8');assert.match(user,/@match\s+https:\/\/teams.cloud.microsoft\/\*/);assert.ok(user.includes(fs.readFileSync(path.join(root,'shared-utils.js'),'utf8')));assert.doesNotMatch(fs.readFileSync(path.join(root,'styles.css'),'utf8'),/@import/);
 });
@@ -60,6 +60,7 @@ test('擴充套件訊息橋接、面板關閉後結果保存與重新載入續�
   await page.addScriptTag({path:path.join(root,'content.js')});
   const first=await page.evaluate(async()=>{const start=await requestExtension('start',{scope:'current',mode:'visible',from:'2026-10-26T00:00:00Z',to:'2026-10-28T00:00:00Z'});await new Promise(r=>setTimeout(r,20));return {start,status:await requestExtension('status'),result:await requestExtension('result')};});
   assert.equal(first.start.ok,true);assert.equal(first.status.running,false);assert.equal(first.status.summary.count,1);assert.equal(first.result.job.status,'partial');
+  const archive=await page.evaluate(()=>requestExtension('archive'));assert.equal(archive.ok,true);assert.match(archive.url,/^blob:/);
   await page.addScriptTag({path:path.join(root,'content.js')});
   const restored=await page.evaluate(async()=>{const before=await requestExtension('status');await requestExtension('resume');await new Promise(r=>setTimeout(r,20));return {before,after:await requestExtension('result')};});
   assert.equal(restored.before.summary.count,1);assert.equal(restored.after.job.conversations[0].messages.length,1);
