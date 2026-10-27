@@ -19,6 +19,19 @@ function makeRange(input={},now=Date.now()){
  if(from>=to)throw Error('開始時間必須早於結束時間');
  return {from,to,timezone:'Asia/Taipei'};
 }
+// Most recent prior Monday–Friday calendar day, at 07:00 in Taipei.
+function defaultAutoRange(now=Date.now()){
+ const day=new Date(now+28800000);day.setUTCHours(7,0,0,0);
+ do{day.setUTCDate(day.getUTCDate()-1);}while([0,6].includes(day.getUTCDay()));
+ return {from:day.getTime()-28800000,to:now,timezone:'Asia/Taipei'};
+}
+function parseAutoHash(hash,now=Date.now()){
+ const p=new URLSearchParams(hash.replace(/^#/,''));if(p.get('teams-export')!=='all')return null;
+ const defaults=defaultAutoRange(now),range=makeRange({from:p.get('from')||new Date(defaults.from).toISOString(),to:p.get('to')||new Date(now).toISOString()});
+ const format=p.get('format')||'zip';if(!['zip','txt','json','csv','html'].includes(format))throw Error('不支援的匯出格式');
+ return {scope:'all',mode:'range',from:new Date(range.from).toISOString(),to:new Date(range.to).toISOString(),format,autodownload:p.get('autodownload')==='1'};
+}
+function skipBeforeRange(job,c){return job.scope==='all'&&job.mode==='range'&&knownTime(c.latest)&&Date.parse(c.latest)<job.range.from;}
 function current(){
  const pane=readPane();
  if(!pane.headerId)throw Error('請先開啟一個 Teams 聊天；此版本略過頻道');
@@ -60,7 +73,7 @@ class Scanner{
  constructor({save=async()=>{},delay=900,maxSteps=2000,onUpdate=()=>{},loginTimeout=600000,captureProvider=null,mediaStore=null}={}){Object.assign(this,{save,delay,maxSteps,onUpdate,loginTimeout,captureProvider});this.mediaStore=mediaStore||(root.TeamsChatImages?new root.TeamsChatImages.MediaStore():null);this.job=null;this.running=false;this.cancelled=false;this.sequence=0;}
  check(){if(this.cancelled)throw stopped();}
  async wait(){this.check();await new Promise(r=>setTimeout(r,this.delay));this.check();}
- summary(){if(!this.job)return null;const j=this.job;return {id:j.id,status:j.status,stage:j.stage,range:j.range,scope:j.scope,mode:j.mode,account:j.account,conversations:j.conversations.map(c=>({key:c.key,name:c.name,status:c.status,count:this.selected(c).length,warnings:c.warnings,error:c.error})),count:j.conversations.reduce((n,c)=>n+this.selected(c).length,0),captureImages:j.captureImages,imageCount:j.conversations.reduce((n,c)=>n+this.selected(c).reduce((sum,m)=>sum+(m.images||[]).filter(i=>i.status==='saved').length,0),0),warnings:j.warnings,error:j.error,updated:j.updated};}
+ summary(){if(!this.job)return null;const j=this.job;return {id:j.id,status:j.status,stage:j.stage,range:j.range,scope:j.scope,mode:j.mode,account:j.account,conversations:j.conversations.map(c=>({key:c.key,name:c.name,status:c.status,count:this.selected(c).length,warnings:c.warnings,error:c.error,latest:c.latest,skipReason:c.skipReason})),count:j.conversations.reduce((n,c)=>n+this.selected(c).length,0),captureImages:j.captureImages,imageCount:j.conversations.reduce((n,c)=>n+this.selected(c).reduce((sum,m)=>sum+(m.images||[]).filter(i=>i.status==='saved').length,0),0),warnings:j.warnings,error:j.error,updated:j.updated};}
  async persist(){if(!this.job)return;this.job.updated=Date.now();this.onUpdate(this.summary());await this.save(this.job);}
  selected(c){return c.messages.filter(m=>m.timestamp===null || this.job.mode==='history'||(m.timestamp>=this.job.range.from&&m.timestamp<this.job.range.to));}
  async auth(){
@@ -103,7 +116,7 @@ class Scanner{
   await this.rail();let previous='',stable=0;const expanded=new Set();
   for(let n=0;n<this.maxSteps;n++){
    await this.auth();const r=readRail();if(r.filtered?.length)throw Error('清單仍有啟用中的篩選');
-   for(const c of r.items)if(!this.job.conversations.some(x=>x.key===c.key))this.job.conversations.push(this.newConversation(c));
+   for(const c of r.items){const existing=this.job.conversations.find(x=>x.key===c.key);if(existing){existing.name=c.name;if(c.latest)existing.latest=c.latest;}else this.job.conversations.push(this.newConversation(c));}
    this.job.stage=`列舉聊天：${this.job.conversations.length} 個`;await this.persist();
    const folder=r.folders.find(v=>!expanded.has(v));
    if(folder){expanded.add(folder);expand(folder);await this.wait();if(item(folder)?.getAttribute('aria-expanded')==='false')throw Error('無法展開聊天資料夾');continue;}
@@ -195,7 +208,11 @@ class Scanner{
   if(!lower&&!c.traversal.lower)c.warnings.push('尚未覆蓋開始時間，達到捲動上限');
   if(c.messages.some(m=>m.timestamp===null))c.warnings.push('部分紀錄缺少完整時間，未判定是否在範圍內');
   if(c.messages.some(m=>m.authorMissing))c.warnings.push('部分紀錄缺少作者');
-  c.warnings=[...new Set(c.warnings)];c.status=bottom&&lower&&!c.warnings.length?'complete':'partial';
+  c.warnings=[...new Set(c.warnings)];
+  if(c.traversal.lower==='crossed-range-start')c.reason='stopped early: reached messages older than range';
+  const rangeCovered=bottom&&c.traversal.lower==='crossed-range-start';
+  const blocking=c.warnings.filter(w=>!w.startsWith('部分紀錄缺少完整時間')&&!(rangeCovered&&w==='部分紀錄缺少作者'));
+  c.status=bottom&&lower&&!blocking.length?'complete':'partial';
  }
  async execute(){
   this.running=true;this.cancelled=false;this.job.status='running';this.job.error=null;
@@ -204,6 +221,8 @@ class Scanner{
    if(this.job.scope==='all')await this.discover();else this.job.discovery={status:'complete',scope:'current'};
    for(let i=0;i<this.job.conversations.length;i++){
     this.check();const c=this.job.conversations[i];if(c.status==='complete')continue;
+    if(skipBeforeRange(this.job,c)){c.status='skipped';c.skipReason='skipped: last activity before range';c.error=c.skipReason;await this.persist();continue;}
+    if(c.status==='skipped'){c.status='pending';c.skipReason=null;}
     this.job.stage=`${i+1}/${this.job.conversations.length}：${c.name}`;
     c.status='running';c.error=null;c.warnings=[];await this.persist();
     for(let attempt=0;attempt<3;attempt++){
@@ -214,10 +233,10 @@ class Scanner{
      }catch(e){c.status='failed';c.error=e.message;await this.persist();if(e.stopped||e.captureUnavailable||/帳號|已切換|原本的聊天/.test(e.message))throw e;if(attempt<2)await this.wait();}
     }await this.persist();
    }
-   this.job.status=this.job.discovery.status==='complete'&&this.job.conversations.length&&this.job.conversations.every(c=>c.status==='complete')?'complete':'partial';this.job.stage='掃描結束';await this.persist();
+   this.job.status=this.job.discovery.status==='complete'&&this.job.conversations.length&&this.job.conversations.every(c=>['complete','skipped'].includes(c.status))?'complete':'partial';this.job.stage='掃描結束';await this.persist();
   }catch(e){this.job.status=e.stopped?'interrupted':'failed';this.job.error=e.message;try{await this.persist();}catch{};}
   finally{this.running=false;this.onUpdate(this.summary());}
  }
 }
-root.TeamsChatUtils={Scanner,parseDate,makeRange,validHost,current,account,identify,prepare};
+root.TeamsChatUtils={Scanner,parseDate,makeRange,defaultAutoRange,parseAutoHash,skipBeforeRange,validHost,current,account,identify,prepare};
 })(globalThis);

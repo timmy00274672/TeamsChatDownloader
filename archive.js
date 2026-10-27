@@ -25,7 +25,7 @@ async function build(job,store){
   }else if(image.status!=='saved'&&j.captureImages)missing++;
  }
  j.imageReport={saved,missing};if(missing){j.status='partial';j.warnings.push(`${missing} 張圖片未保存，請查看各訊息的圖片連結與原因。`);}
- entries.unshift({name:'chat.txt',data:root.TeamsChatFormats.format(j,'txt')},{name:'report.json',data:JSON.stringify(j,null,2)});
+ entries.unshift({name:'compact.txt',data:root.TeamsChatFormats.compact(j)},{name:'chat.txt',data:root.TeamsChatFormats.format(j,'txt')},{name:'report.json',data:JSON.stringify(j,null,2)});
  return zip(entries);
 }
 root.TeamsChatArchive={zip,build};

@@ -94,3 +94,22 @@ npm test
 原本 `graph-exporter/` 保留為上游獨立工具，**本修正版不載入、不執行該目錄**；它不是無 API 的方案。原始 README 可在 Git 歷史的上游版本查看。
 
 沿用上游 MIT 授權，保留 LICENSE。
+
+### Automated daily export (userscript v1.4.0)
+
+Open Teams with `#teams-export=all&from=2026-10-26T07:00:00%2B08:00&to=2026-10-27T12:00:00%2B08:00&format=zip&autodownload=1`
+appended to the URL. `from` and `to` are optional; defaults are the previous
+Monday–Friday calendar day at 07:00 Asia/Taipei and now. Monday uses Friday;
+Saturday and Sunday also use Friday. Encode `+` in ISO offsets as `%2B` (or use `Z`).
+`format` defaults to ZIP; omit `autodownload=1` to leave the results for manual download.
+The trigger waits for the Teams interface/login and consumes the hash before starting.
+**Alt+Shift+E** starts the same default range, all chats, with automatic ZIP download.
+The panel remains available to stop the scan; interrupted/partial jobs also download.
+Automatic image capture uses the existing local capture path; restricted images may
+require enabling capture manually and resuming.
+
+All-chat range scans skip opening chats with a valid list activity time strictly
+before the range start. Missing/invalid activity times are scanned normally.
+Skipped chats remain in `report.json` with their status and reason. ZIPs include
+`compact.txt`: Taipei timestamps, in-range messages only, condensed replies and
+image markers, plus counts for skipped chats, unknown times and image results.
