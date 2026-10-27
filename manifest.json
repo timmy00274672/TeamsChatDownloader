@@ -1,12 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "Teams Chat Downloader",
-  "version": "1.1.0",
-  "description": "Download Microsoft Teams chat history from web version with multiple export formats",
-  "permissions": ["activeTab", "storage", "downloads"],
+  "name": "Teams Chat Downloader (DOM local)",
+  "version": "1.2.0",
+  "description": "Export rendered Teams chats with date ranges, batch scanning and local checkpoints. No Teams API calls.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "downloads"
+  ],
   "host_permissions": [
     "https://teams.microsoft.com/*",
-    "https://teams.live.com/*"
+    "https://teams.live.com/*",
+    "https://teams.cloud.microsoft/*"
   ],
   "action": {
     "default_popup": "popup.html",
@@ -14,8 +19,16 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://teams.microsoft.com/*", "https://teams.live.com/*"],
-      "js": ["shared-utils.js", "content.js"],
+      "matches": [
+        "https://teams.microsoft.com/*",
+        "https://teams.live.com/*",
+        "https://teams.cloud.microsoft/*"
+      ],
+      "js": [
+        "dom.js",
+        "shared-utils.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],

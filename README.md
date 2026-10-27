@@ -1,165 +1,66 @@
-# 📋 Teams Chat Downloader
+# Teams Chat Downloader — 本機 DOM 修正版
 
-**Export Microsoft Teams chat history with media — 3 tools for every use case.**
+以 [rahulmasal/TeamsChatDownloader](https://github.com/rahulmasal/TeamsChatDownloader) 為基礎修正，保留 Chrome 擴充套件、單檔 Tampermonkey 及 TXT／JSON／CSV／HTML 匯出形式。**本機版只讀 Teams 已載入網頁，不呼叫 Graph 或 Teams 內部 API，略過所有頻道。**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-green.svg)](#-chrome-extension)
-[![Tampermonkey](https://img.shields.io/badge/Tampermonkey-Script-yellow.svg)](#-tampermonkey-script)
-[![Graph API](https://img.shields.io/badge/Graph_API-CLI-purple.svg)](#-graph-api-exporter)
+此為本機修改版，尚未送回上游，也不代表上游官方版本。
 
----
+## 已修正
 
-## 🎯 Pick Your Tool
+- 加入實際使用的 `https://teams.cloud.microsoft/`，更新新版訊息內容、作者、datetime 與聊天清單的讀取方式。
+- 每次捲動即累積訊息，避免 Teams 虛擬清單回收 DOM 後，只匯出最後一個畫面的內容。
+- 用穩定訊息 ID 去重，保留相同文字的不同訊息；時間缺失不再填入目前時間。
+- 預設最近 24 小時，可指定開始與結束；日期未帶時區時固定使用台北時間，包含開始、不含結束。
+- 支援目前聊天或全部可列舉聊天，包含群組、靜音及會議聊天；展開資料夾與 See more。
+- 增加停止、本機進度與續抓。單一聊天失敗最多重試三次，再繼續下一個。
+- 匯出含每個聊天的完整度與錯誤，未知時間紀錄另行標示。引文、圖片描述、附件名稱及頁面可取得的連結會保留。
+- 移除執行期下載 GitHub 選擇器與 Google Fonts；修正版不向第三方服務傳送訊息。
 
-| Tool | Best For | Media Export | Setup Time |
-|------|----------|-------------|-----------|
-| [**Chrome Extension**](#-chrome-extension) | Sharing with non-technical users | Text only | 30 seconds |
-| [**Tampermonkey Script**](#-tampermonkey-script) | Personal use, fastest option | Text only | 1 minute |
-| [**Graph API Exporter**](#-graph-api-exporter) | Full export with images & files | ✅ All media | 10 minutes |
+## 方式一：Chrome 擴充套件（建議）
 
----
+1. 在 Chrome 開啟 `chrome://extensions/`，啟用「開發人員模式」。
+2. 按「載入未封裝項目」，選取 `/Users/timchen/workspace/TeamsChatDownloader`。
+3. 重新整理 Teams 網頁，開啟任一聊天。安裝前已開啟的 Teams 分頁也必須重新整理。
+4. 點擴充套件圖示，選「所有聊天（略過頻道）」或「目前聊天」。
+5. 確認時間後按「掃描指定時段」。完成後選 TXT，按「下載目前結果」。
 
-## 🧩 Chrome Extension
+也可以先用「目前已載入畫面」快速檢查格式；此模式不代表指定時段完整匯出，會明列部分完成。「目前聊天全部歷史」不套用日期範圍。
 
-A polished Chrome extension with a dark-themed popup UI.
+掃描工作由 Teams 分頁中的程式執行；關閉擴充套件面板不會中止。按「停止」後可下載目前結果，再按「續抓」。重新整理 Teams 後，同一分頁的本機進度可以續抓。續抓會保留原帳號與時間範圍，不採用新填入的日期。
 
-**Features:**
-- 🔍 Quick Scan or Full History (auto-scroll)
-- 📄 Export as TXT, JSON, CSV, or HTML
-- 🛡️ Multiple DOM selector strategies for resilience
-- 🔒 All data stays in your browser
+擴充套件進度按 Chrome 分頁 ID 分開儲存在 `chrome.storage.local`。關閉分頁、重開瀏覽器、解除安裝或清除擴充套件資料後，不保證可再以原分頁續抓。跨分頁續抓與進度檔匯入不是本版功能。
 
-**Quick Start:**
-1. Go to `chrome://extensions/` → Enable Developer Mode
-2. Click **Load unpacked** → Select the project root folder
-3. Navigate to Teams → Click the extension icon → Scan & Download
+## 方式二：Tampermonkey 單檔腳本
 
-![Extension UI](https://img.shields.io/badge/UI-Dark_Theme-1a1a2e?style=flat-square)
+在已安裝 Tampermonkey 的 Chrome 中新增腳本，將 `tampermonkey/teams-chat-downloader.user.js` 全文貼入並儲存；重新整理 Teams 後，右下角會出現「Teams 匯出」按鈕。也可在 Tampermonkey 的匯入功能選擇這個檔案。
 
----
+腳本與擴充套件使用相同掃描引擎。進度保存在這個 userscript 的本機 GM 儲存空間；關閉面板仍可掃描，重新整理後可續抓。單檔腳本一次只操作一個分頁；避免在兩個 Teams 分頁同時啟動，因為它們共用腳本進度。
 
-## 🐒 Tampermonkey Script
+**只選一種方式使用。不要同時在同一 Teams 分頁執行擴充套件和 userscript。**
 
-A single-file userscript that injects a floating download button directly into Teams.
+## 範圍與完整度
 
-**Features:**
-- ⚡ Fastest option — zero message-passing overhead
-- 💬 Floating "Chat Downloader" button on every Teams page
-- 📄 Same 4 export formats (TXT, JSON, CSV, HTML)
-- 🔄 Auto-scroll for full history
+- 支援這個帳號實際使用的新版 Teams 網頁結構。舊版介面或未驗證的 Teams Live 結構可能需要再調整；讀不到時會報錯。
+- 只操作聊天清單可列舉的內容；隱藏、封存、已刪除及權限外資料不保證可取得。所有頻道排除。
+- 掃描可能將聊天標為已讀。期間不要切換這個 Teams 分頁的聊天，也不要同時執行另一份掃描。日常使用可在另一個分頁進行。
+- Teams 網頁本身仍會正常連線載入資料。工具不自行呼叫 Teams API、不讀取登入 token、不開啟訊息內連結、不下載附件、不做圖片 OCR。
+- 會議系統紀錄可能缺少作者或完整時間：這些紀錄保留並註明範圍不明，報告維持部分完成。獨立討論串尚未展開；一般引文回覆保留原文。
+- 到達指定開始時間，或遇到明確歷史起始／空白標記，才有機會標為掃描完成。只有穩定捲動頂部卻無起始標記時仍為部分完成，不宣稱稽核備份完整性。
+- 每階段最多捲動 2000 次，每步約 900ms；達上限會部分完成。大量聊天可能需數十分鐘。
+- 本機進度可能包含指定時間外的邊界前後文。下載檔僅保留範圍內及時間不明紀錄。Chrome 本機儲存額度不足時會停止並顯示失敗，記憶體中的目前結果仍可下載；不要重新整理分頁。
 
-**Quick Start:**
-1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser
-2. **[Click here to auto-install the script](https://raw.githubusercontent.com/rahulmasal/TeamsChatDownloader/main/tampermonkey/teams-chat-downloader.user.js)** (Tampermonkey will prompt you to install it)
-3. Open Teams → Click "💬 Chat Downloader" button in bottom-right
+## 開發與測試
 
----
-
-## 🔗 Graph API Exporter
-
-A Node.js CLI that uses Microsoft Graph API to export **complete chat history with all media and attachments**.
-
-**Features:**
-- 📥 Complete message history via official API (no DOM scraping)
-- 🖼️ Downloads inline images, file attachments, GIFs
-- 👍 Preserves reactions, edits, deletions, mentions
-- 📊 Interactive mode — browse & select chats
-- 🔄 Batch export all chats at once
-- 🔐 Secure device-code authentication with token caching
-- ⏱️ Rate limit handling with automatic retry
-
-**Quick Start:**
-```bash
-cd graph-exporter
-npm install
-# Edit config.js → Add your Azure AD Client ID
-node index.js
+```sh
+cd /Users/timchen/workspace/TeamsChatDownloader
+npm ci
+npm run build
+npm test
 ```
 
-**Output structure:**
-```
-exported-chats/
-├── John Doe, Jane Smith/
-│   ├── chat.html          ← Beautiful dark-themed viewer
-│   ├── chat.json          ← Structured data
-│   ├── chat.txt           ← Plain text
-│   ├── metadata.json      ← Chat info & stats
-│   └── media/
-│       ├── inline_abc.png ← Pasted images
-│       └── report.pdf     ← File attachments
-```
+`dom.js` 讀取頁面；`shared-utils.js` 負責日期、批次、捲動與進度；`content.js` 連接擴充套件訊息與儲存；`export-formats.js` 提供各種格式。單檔腳本由 `npm run build` 產生，請勿直接修改生成檔。
 
-> 📖 See [`graph-exporter/README.md`](graph-exporter/README.md) for Azure AD setup instructions.
+測試使用本機模擬 Teams 頁面驗證日期邊界、DOM 回收、ID 去重、批次含靜音聊天、載入更多、局部失敗、停止與續抓、帳號變更，以及未知時間輸出。測試不需要登入，也不呼叫 Teams API。
 
----
+原本 `graph-exporter/` 保留為上游獨立工具，**本修正版不載入、不執行該目錄**；它不是無 API 的方案。原始 README 可在 Git 歷史的上游版本查看。
 
-## 📂 Project Structure
-
-```
-TeamsChatDownloader/
-│
-├── manifest.json           ┐
-├── content.js              │ Chrome Extension
-├── popup.html / .js        │ (browser-based)
-├── styles.css              │
-├── icon16/48/128.png       ┘
-│
-├── tampermonkey/
-│   └── teams-chat-downloader.user.js    ← Tampermonkey script
-│
-└── graph-exporter/
-    ├── index.js            ← CLI entry point
-    ├── auth.js             ← MSAL authentication
-    ├── graph.js            ← Graph API client
-    ├── exporter.js         ← Export engine
-    ├── config.js           ← Azure AD configuration
-    └── package.json        ← Dependencies
-```
-
----
-
-## 🔒 Privacy & Security
-
-- **No data is transmitted externally** — all processing happens locally
-- Chrome Extension & Tampermonkey run entirely in your browser
-- Graph API Exporter authenticates via Microsoft's official OAuth2 flow
-- Token cache is stored locally and git-ignored
-- No telemetry, no analytics, no tracking
-
----
-
-## 🛡️ Permissions
-
-### Chrome Extension
-| Permission | Purpose |
-|-----------|---------|
-| `activeTab` | Read chat messages from the current Teams tab |
-| `storage` | Cache scan results between popup sessions |
-| `downloads` | Save exported files to disk |
-
-### Graph API Exporter
-| Permission | Purpose |
-|-----------|---------|
-| `Chat.Read` | Read your chat messages |
-| `Files.Read.All` | Download shared files and attachments |
-| `User.Read` | Display your profile name |
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
----
-
-## 📄 License
-
-This project is open source and available under the [MIT License](LICENSE).
-
----
-
-**Made with ❤️ by [Rahul Masal](https://github.com/rahulmasal)**
+沿用上游 MIT 授權，保留 LICENSE。

@@ -1,251 +1,200 @@
-/**
- * Teams Chat Downloader - Shared Utilities
- * Contains common functions used by both the Chrome extension and Tampermonkey script
- */
-
-/**
- * Selector strategies — ordered by priority.
- * Teams frequently changes its DOM; having fallbacks makes the extension more resilient.
- */
-let SELECTOR_STRATEGIES = [
-    {
-        name: 'data-tid',
-        chatContainer: '[data-tid="chat-pane-list"], [data-tid="chat-list"], [data-tid="message-pane-list"]',
-        message: '[data-tid="chat-pane-message"], [data-tid="message"], [data-tid="message-body"]',
-        sender: '[data-tid="message-author-name"], [data-tid="message-sender"]',
-        content: '[data-tid="message-text"], [data-tid="message-content"]',
-        timestamp: '[data-tid="message-timestamp"], [data-tid="ts-message-timestamp"]',
-        attachment: '[data-tid="file-card"], [data-tid="message-attachment"]',
-        attachmentName: '[data-tid="file-card-name"], [data-tid="attachment-name"]'
-    },
-    {
-        name: 'aria-role',
-        chatContainer: '[role="main"] [role="list"], [role="log"]',
-        message: '[role="listitem"], [data-is-focusable="true"]',
-        sender: '[data-testid="message-author"], .ui-chat__message__author',
-        content: '[data-testid="message-body"], .ui-chat__message__content',
-        timestamp: 'time[datetime], [data-testid="message-timestamp"]',
-        attachment: '.ui-attachment, [data-testid="file-attachment"]',
-        attachmentName: '.ui-attachment__header, [data-testid="file-name"]'
-    },
-    {
-        name: 'class-based',
-        chatContainer: '.ts-message-list-container, .message-list',
-        message: '.ts-message, .message-body-content',
-        sender: '.ts-message-sender, .message-sender-name',
-        content: '.ts-message-text, .message-body-text',
-        timestamp: '.ts-message-timestamp, time',
-        attachment: '.ts-attachment, .file-attachment',
-        attachmentName: '.ts-attachment-name, .file-name',
-    }
-];
-
-// Asynchronously fetch latest selectors from GitHub (failsafe back to hardcoded)
-(async function initSelectors() {
-    try {
-        const res = await fetch('https://raw.githubusercontent.com/rahulmasal/TeamsChatDownloader/main/selectors.json');
-        if (res.ok) {
-            SELECTOR_STRATEGIES = await res.json();
-        }
-    } catch (e) {
-        // use fallback hardcoded strategies
-    }
-})();
-
-/**
- * Find the first matching element using multiple selectors from a strategy.
- */
-function querySelectorFallback(root, selectorString) {
-    const selectors = selectorString.split(',').map(s => s.trim());
-    for (const selector of selectors) {
-        const el = root.querySelector(selector);
-        if (el) return el;
-    }
-    return null;
+/* Local DOM-only scanner. No fetch/XHR, tokens, application stores or remote selectors. */
+(function(root){
+'use strict';
+const {readMessages,readRail,readPane}=root.TeamsChatDOM;
+const validHost=host=>['teams.microsoft.com','teams.cloud.microsoft','teams.live.com'].includes(host);
+const knownTime=value=> typeof value==='string' && /(Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
+function parseDate(value){
+ const local=/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::(\d{2}))?$/.exec(value||'');
+ const input=local?`${local[1]}T${local[2]}:${local[3]||'00'}+08:00`:value;
+ if(!knownTime(input))throw Error('請輸入有效日期時間；未帶時區時使用台北時間');
+ const t=Date.parse(input);
+ if(local && new Date(t+28800000).toISOString().slice(0,19)!==`${local[1]}T${local[2]}:${local[3]||'00'}`)throw Error('日期時間無效');
+ if(!local){const d=new Date(value.slice(0,10)+'T00:00:00Z');if(d.toISOString().slice(0,10)!==value.slice(0,10))throw Error('日期無效');}
+ return t;
 }
-
-function querySelectorAllFallback(root, selectorString) {
-    const selectors = selectorString.split(',').map(s => s.trim());
-    for (const selector of selectors) {
-        const elements = root.querySelectorAll(selector);
-        if (elements.length > 0) return elements;
-    }
-    return [];
+function makeRange(input={},now=Date.now()){
+ const to=input.to?parseDate(input.to):now;
+ const from=input.from?parseDate(input.from):to-86400000;
+ if(from>=to)throw Error('開始時間必須早於結束時間');
+ return {from,to,timezone:'Asia/Taipei'};
 }
-
-/**
- * Detect which selector strategy works for the current Teams DOM.
- */
-function detectStrategy() {
-    for (const strategy of SELECTOR_STRATEGIES) {
-        const container = querySelectorFallback(document, strategy.chatContainer);
-        if (container) {
-            const messages = querySelectorAllFallback(container, strategy.message);
-            if (messages.length > 0) {
-                console.log(`[TeamsChatDownloader] Using selector strategy: ${strategy.name}`);
-                return { strategy, container };
-            }
-        }
-    }
-    return null;
+function current(){
+ const pane=readPane();
+ if(!pane.headerId)throw Error('請先開啟一個 Teams 聊天；此版本略過頻道');
+ return {key:pane.headerId.slice('chat-header-'.length),name:pane.title||'未命名聊天',type:'chat'};
 }
-
-/**
- * Auto-scroll the chat container to load older messages.
- * Teams uses virtual scrolling, so only visible messages are in the DOM.
- */
-async function loadFullChat(container, onProgress, maxAttempts = 50, scrollDelay = 1200) {
-    let previousHeight = 0;
-    let attempts = 0;
-
-    while (attempts < maxAttempts) {
-        const currentHeight = container.scrollHeight;
-
-        if (currentHeight === previousHeight && attempts > 2) {
-            // No new content loaded after scrolling — we've reached the top
-            break;
-        }
-
-        previousHeight = currentHeight;
-        container.scrollTop = 0; // Scroll to top to trigger lazy loading
-
-        const progress = Math.min(90, Math.round((attempts / maxAttempts) * 90));
-        if (onProgress) onProgress(progress);
-
-        await new Promise(resolve => setTimeout(resolve, scrollDelay));
-        attempts++;
-    }
-
-    // Scroll back to bottom so the user sees the latest messages
-    container.scrollTop = container.scrollHeight;
+let verifiedProfile=null;
+const emailFrom=text=>text?.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]?.toLowerCase()||null;
+function profile(){const trigger=document.querySelector('[data-tid="me-control-avatar-trigger"]');const avatar=document.querySelector('[data-tid="me-control-avatar"]');return {trigger,fingerprint:(avatar?.getAttribute('aria-label')||'')+'|'+(trigger?.innerText||'')};}
+function account(){
+ const p=profile();if(!p.trigger||!p.trigger.getClientRects().length)return null;
+ const dialog=document.querySelector('[data-tid="me-control-menu-dialog"]');
+ const email=emailFrom(p.trigger.getAttribute('aria-label'))||(dialog?.getClientRects().length?emailFrom(dialog.innerText):null);
+ if(email){verifiedProfile={...p,email};return email;}
+ return verifiedProfile?.trigger===p.trigger&&verifiedProfile.fingerprint===p.fingerprint?verifiedProfile.email:null;
 }
-
-/**
- * Extract a timestamp value from a timestamp element.
- * Handles both data-timestamp attributes (Unix ms or s) and datetime attributes.
- */
-function extractTimestamp(element, strategy) {
-    if (!element) return null;
-
-    // Try data-timestamp attribute first
-    const dataTs = element.getAttribute('data-timestamp');
-    if (dataTs) {
-        let ts = parseInt(dataTs, 10);
-        if (!isNaN(ts)) {
-            // If it looks like seconds instead of milliseconds, convert
-            if (ts < 1e12) ts *= 1000;
-            return ts;
-        }
-    }
-
-    // Try datetime attribute (ISO 8601)
-    const datetime = element.getAttribute('datetime');
-    if (datetime) {
-        const d = new Date(datetime);
-        if (!isNaN(d.getTime())) return d.getTime();
-    }
-
-    // Try title attribute as a displayable date
-    const title = element.getAttribute('title');
-    if (title) {
-        const d = new Date(title);
-        if (!isNaN(d.getTime())) return d.getTime();
-    }
-
-    // Fallback: use textContent as a date string
-    const text = element.textContent?.trim();
-    if (text) {
-        const d = new Date(text);
-        if (!isNaN(d.getTime())) return d.getTime();
-    }
-
-    return Date.now(); // Last resort fallback
+async function identify(){
+ const p=profile();if(!p.trigger)throw Error('請先登入 Teams 並等待聊天介面載入');
+ const direct=emailFrom(p.trigger.getAttribute('aria-label'));if(direct){verifiedProfile={...p,email:direct};return direct;}
+ const alreadyOpen=!!document.querySelector('[data-tid="me-control-menu-dialog"]')?.getClientRects().length;
+ if(!alreadyOpen)p.trigger.click();
+ try{for(let i=0;i<25;i++){const dialog=document.querySelector('[data-tid="me-control-menu-dialog"]');const email=dialog?.getClientRects().length?emailFrom(dialog.innerText):null;if(email){verifiedProfile={...profile(),email};return email;}await new Promise(r=>setTimeout(r,200));}throw Error('無法從帳號面板確認登入帳號');}
+ finally{if(!alreadyOpen&&document.querySelector('[data-tid="me-control-menu-dialog"]')?.getClientRects().length)p.trigger.click();}
 }
-
-/**
- * Sanitize text content to prevent XSS vulnerabilities
- */
-function sanitizeText(text) {
-    if (!text) return '';
-
-    // Basic HTML entity encoding to prevent XSS
-    let sanitized = text;
-    sanitized = sanitized.replace(/&/g, '&');
-    sanitized = sanitized.replace(/</g, '<');
-    sanitized = sanitized.replace(/>/g, '>');
-    sanitized = sanitized.replace(/"/g, '"');
-    sanitized = sanitized.replace(/'/g, '&#x27;');
-    return sanitized;
+function matches(c,query){return [...document.querySelectorAll(query)].filter(e=>e.getClientRects().length);}
+function tree(){return matches(null,'[role="tree"]')[0];}
+function item(value){return [...document.querySelectorAll('[role="treeitem"]')].find(e=>e.getAttribute('data-fui-tree-item-value')===value);}
+function expand(value){const e=item(value);if(!e)throw Error('清單資料夾已變更');e.focus();e.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',code:'ArrowRight',bubbles:true}));}
+function buttonText(e){return (e.getAttribute('aria-label')||e.innerText||'').trim();}
+const stopped=()=>Object.assign(Error('已停止，可續抓'),{stopped:true});
+function prepare(input={}){
+ if(!validHost(location.hostname))throw Error('此網頁不是支援的 Teams 網址');
+  const a=account();if(!a)throw Error('請先登入 Teams 並等待聊天介面載入');
+  if(!['current','all'].includes(input.scope||'all')||!['range','visible','history'].includes(input.mode||'range'))throw Error('不支援的掃描範圍');
+  const mode=input.mode||'range',scope=mode==='range'?(input.scope||'all'):'current';
+  const initial=scope==='current'?[current()]:[];
+ return {a,mode,scope,initial,range:makeRange(input)};
 }
-
-/**
- * Scan all visible chat messages using the detected strategy.
- */
-function extractMessages(container, strategy) {
-    const messages = [];
-    const messageElements = querySelectorAllFallback(container, strategy.message);
-    const seen = new Set(); // For deduplication
-
-    messageElements.forEach(element => {
-        const senderEl = querySelectorFallback(element, strategy.sender);
-        const contentEl = querySelectorFallback(element, strategy.content);
-        const timestampEl = querySelectorFallback(element, strategy.timestamp);
-
-        const sender = sanitizeText(senderEl?.textContent?.trim() || 'Unknown');
-        const text = sanitizeText(contentEl?.textContent?.trim() || '');
-        const timestamp = extractTimestamp(timestampEl, strategy);
-
-        // Skip empty messages
-        if (!text && !senderEl) return;
-
-        // Deduplication key
-        const dedupKey = `${sender}|${timestamp}|${text.substring(0, 50)}`;
-        if (seen.has(dedupKey)) return;
-        seen.add(dedupKey);
-
-        // Extract attachments
-        const attachments = [];
-        const attachmentElements = querySelectorAllFallback(element, strategy.attachment);
-        attachmentElements.forEach(attachment => {
-            const nameEl = querySelectorFallback(attachment, strategy.attachmentName);
-            const name = sanitizeText(nameEl?.textContent?.trim());
-            if (name) attachments.push(name);
-        });
-
-        messages.push({
-            sender,
-            text,
-            timestamp: timestamp || Date.now(),
-            attachments
-        });
-    });
-
-    return messages;
+class Scanner{
+ constructor({save=async()=>{},delay=900,maxSteps=2000,onUpdate=()=>{},loginTimeout=600000}={}){Object.assign(this,{save,delay,maxSteps,onUpdate,loginTimeout});this.job=null;this.running=false;this.cancelled=false;this.sequence=0;}
+ check(){if(this.cancelled)throw stopped();}
+ async wait(){this.check();await new Promise(r=>setTimeout(r,this.delay));this.check();}
+ summary(){if(!this.job)return null;const j=this.job;return {id:j.id,status:j.status,stage:j.stage,range:j.range,scope:j.scope,mode:j.mode,account:j.account,conversations:j.conversations.map(c=>({key:c.key,name:c.name,status:c.status,count:this.selected(c).length,warnings:c.warnings,error:c.error})),count:j.conversations.reduce((n,c)=>n+this.selected(c).length,0),warnings:j.warnings,error:j.error,updated:j.updated};}
+ async persist(){if(!this.job)return;this.job.updated=Date.now();this.onUpdate(this.summary());await this.save(this.job);}
+ selected(c){return c.messages.filter(m=>m.timestamp===null || this.job.mode==='history'||(m.timestamp>=this.job.range.from&&m.timestamp<this.job.range.to));}
+ async auth(){
+  const end=Date.now()+this.loginTimeout;
+  while(Date.now()<end){this.check();let a=account();if(!a&&profile().trigger){try{a=await identify();}catch{}}if(a){if(a!==this.job.account)throw Error('登入帳號與此匯出不同，已停止');if(this.job.status==='waiting-login'){this.job.status='running';await this.persist();}return;}
+   if(this.job.status!=='waiting-login'){this.job.status='waiting-login';await this.persist();}await this.wait();
+  }throw Error('等待登入逾時，進度已保留');
+ }
+ async start(input={}){
+  if(this.running)throw Error('已有掃描正在執行');
+  this.running=true;this.cancelled=false;
+  let prepared;try{await identify();this.check();prepared=prepare(input);}catch(e){this.running=false;throw e;}
+  const {a,mode,scope,initial,range}=prepared;
+  const conversations=initial.map(c=>this.newConversation(c));
+  this.job={version:2,id:crypto.randomUUID(),created:Date.now(),account:a,range,scope,mode,status:'running',stage:'準備中',discovery:{status:'pending'},warnings:['僅掃描網頁可列舉的聊天；隱藏／封存內容可能不在清單中。','所有頻道依需求排除。'],conversations};
+  await this.execute();return this.job;
+ }
+ newConversation(c){return {...c,status:'pending',messages:[],warnings:[],traversal:{},attempts:0};}
+ async resume(job){
+  if(this.running)throw Error('已有掃描正在執行');
+  if(!job||job.version!==2)throw Error('沒有可續抓的工作');
+  this.running=true;this.cancelled=false;
+  try{await identify();this.check();if(account()!==job.account)throw Error('目前登入帳號與進度不同');}catch(e){this.running=false;throw e;}
+  this.job=structuredClone(job);await this.execute();return this.job;
+ }
+ stop(){this.cancelled=true;}
+ async rail(){
+  const buttons=matches(null,'[data-tid="app-bar-wrapper"] button');
+  const chat=buttons.find(e=>/^(Chat|聊天)$/i.test(buttonText(e)));
+  if(chat)chat.click();
+  for(let i=0;i<40&&!tree();i++)await this.wait();
+  if(!tree())throw Error('找不到聊天清單，可能尚未載入或 Teams 已改版');
+  const filters=matches(null,'[role="toolbar"] [role="checkbox"][aria-checked="true"], [role="toolbar"] [aria-pressed="true"]');
+  for(const f of filters)if(/^(Unread|Chats|Meeting chats|未讀|聊天|會議聊天|未读|会议聊天)$/i.test(buttonText(f))){f.click();await this.wait();}
+  const search=matches(null,'input').find(e=>/^(Filter by name|依名稱篩選|按名称筛选)$/i.test(e.getAttribute('placeholder')||''));
+  if(search?.value)throw Error('請先清除聊天清單的名稱篩選再掃描');
+  tree().scrollTop=0;await this.wait();
+ }
+ async discover(){
+  await this.rail();let previous='',stable=0;const expanded=new Set();
+  for(let n=0;n<this.maxSteps;n++){
+   await this.auth();const r=readRail();if(r.filtered?.length)throw Error('清單仍有啟用中的篩選');
+   for(const c of r.items)if(!this.job.conversations.some(x=>x.key===c.key))this.job.conversations.push(this.newConversation(c));
+   this.job.stage=`列舉聊天：${this.job.conversations.length} 個`;await this.persist();
+   const folder=r.folders.find(v=>!expanded.has(v));
+   if(folder){expanded.add(folder);expand(folder);await this.wait();if(item(folder)?.getAttribute('aria-expanded')==='false')throw Error('無法展開聊天資料夾');continue;}
+   if(r.moreValues?.length){const e=item(r.moreValues[0]);e.scrollIntoView({block:'nearest'});e.click();await this.wait();continue;}
+   if(r.moreLabels?.length){const e=matches(null,'[role="tree"] button,[role="tree"] [role="treeitem"]').find(e=>e.innerText.trim()===r.moreLabels[0]);if(!e)throw Error('無法展開更多聊天');e.click();await this.wait();continue;}
+   const signature=JSON.stringify([r.items.map(x=>x.key),r.top,r.bottom]);
+   stable=!r.loading&&r.bottom!==null&&r.bottom<=2&&signature===previous?stable+1:0;
+   if(stable>=4){this.job.discovery={status:this.job.conversations.length?'complete':'partial',boundary:'observed-stable-bottom'};return;}
+   previous=signature;tree().scrollTop+=tree().clientHeight*.7;await this.wait();
+  }this.job.discovery={status:'partial',warning:'列舉達到捲動上限，可能有未發現聊天'};
+ }
+ async open(c){
+  await this.rail();let previous='',stable=0;
+  for(let n=0;n<this.maxSteps;n++){
+   await this.auth();const r=readRail(),found=r.items.find(x=>x.key===c.key);
+   if(found){item(found.value).click();for(let i=0;i<40;i++){await this.wait();const p=readPane();if(p.headerId==='chat-header-'+c.key&&p.viewport)return;}throw Error('聊天訊息未載入');}
+   if(r.folders[0]){expand(r.folders[0]);await this.wait();continue;}
+   if(r.moreValues?.length){const e=item(r.moreValues[0]);e.scrollIntoView({block:'nearest'});e.click();await this.wait();continue;}
+   const signature=JSON.stringify([r.items.map(x=>x.key),r.top,r.bottom]);stable=r.bottom<=2&&signature===previous?stable+1:0;if(stable>=4)break;
+   previous=signature;tree().scrollTop+=tree().clientHeight*.7;await this.wait();
+  }throw Error('此聊天已不在可讀取清單中');
+ }
+ async capture(c){
+  await this.auth();
+  if(readPane().headerId!=='chat-header-'+c.key)throw Error('聊天已切換；停止以免混入其他聊天');
+  for(let i=0;i<50;i++){
+   const more=matches(null,'[id^="message-body-"] button').find(e=>/^(see more|read more|show more|顯示更多|查看更多|閱讀更多|展开|展開)$/i.test(buttonText(e)));
+   if(!more)break;more.click();await this.wait();
+  }
+  const raw=readMessages(),pane=readPane();
+  if(pane.replies)c.warnings.push('此聊天含獨立討論串，尚未展開，結果部分完成');
+  for(const m of raw){
+   const time=knownTime(m.time)?Date.parse(m.time):null;
+   const identity=m.id?'id:'+m.id:'uncertain:'+this.job.id+':'+(++this.sequence);
+   const converted={id:m.id,key:identity,sender:m.author||'作者不明',authorMissing:!m.author,timestamp:time,rawTime:m.rawTime,text:m.text,attachments:m.links||[],parent:m.parent,quote:m.quote,uncertainIdentity:!m.id};
+   const old=c.messages.find(x=>x.key===identity);
+   if(old)Object.assign(old,converted);else c.messages.push(converted);
+   if(m.truncated)c.warnings.push('部分訊息未展開全文');
+   if(!m.id)c.warnings.push('部分訊息沒有穩定識別值，保留可能重複的紀錄');
+  }
+  c.warnings=[...new Set(c.warnings)];await this.persist();return {raw,pane};
+ }
+ viewport(){const e=matches(null,'[data-tid="message-pane-list-viewport"]')[0];if(!e)throw Error('找不到聊天捲動區');return e;}
+ async scan(c){
+  if(this.job.mode==='visible'){
+   const {pane}=await this.capture(c);c.status='partial';c.warnings.push('只讀取目前已載入畫面，未掃描全部歷史');c.traversal={snapshot:true};return;
+  }
+  let previous='',stable=0,bottom=false,lower=false;
+  for(let i=0;i<this.maxSteps;i++){
+   const {raw,pane}=await this.capture(c);const signature=JSON.stringify([raw.map(m=>m.id||m.text),pane.bottom]);
+   stable=!pane.busy&&pane.bottom!==null&&pane.bottom<=2&&signature===previous?stable+1:0;
+   if(stable>=3){bottom=true;c.traversal.upper='observed-stable-bottom';break;}
+   previous=signature;this.viewport().scrollTop=this.viewport().scrollHeight;await this.wait();
+  }
+  previous='';stable=0;
+  for(let i=0;i<this.maxSteps;i++){
+   const {raw,pane}=await this.capture(c),dated=raw.filter(m=>knownTime(m.time));
+   const ordered=dated.every((m,i)=>!i||Date.parse(dated[i-1].time)<=Date.parse(m.time));
+   if(this.job.mode==='range'&&!pane.busy&&raw.length&&dated.length===raw.length&&ordered&&dated.some(m=>Date.parse(m.time)<this.job.range.from)){lower=true;c.traversal.lower='crossed-range-start';break;}
+   if(!pane.busy&&(pane.startMarker||pane.empty)){lower=true;c.traversal.lower=pane.empty?'explicit-empty':'explicit-start';break;}
+   const signature=JSON.stringify([raw.map(m=>m.id||m.text),pane.top]);stable=!pane.busy&&pane.top!==null&&pane.top<=2&&signature===previous?stable+1:0;
+   if(stable>=4){c.traversal.lower='observed-stable-top';c.warnings.push('頂部已穩定，但沒有明確歷史起始標記，無法確認更早內容完整載入');break;}
+   previous=signature;this.viewport().scrollTop-=this.viewport().clientHeight*.65;await this.wait();
+  }
+  if(!bottom)c.warnings.push('未確認最新訊息的底部邊界');
+  if(!lower&&!c.traversal.lower)c.warnings.push('尚未覆蓋開始時間，達到捲動上限');
+  if(c.messages.some(m=>m.timestamp===null))c.warnings.push('部分紀錄缺少完整時間，未判定是否在範圍內');
+  if(c.messages.some(m=>m.authorMissing))c.warnings.push('部分紀錄缺少作者');
+  c.warnings=[...new Set(c.warnings)];c.status=bottom&&lower&&!c.warnings.length?'complete':'partial';
+ }
+ async execute(){
+  this.running=true;this.cancelled=false;this.job.status='running';this.job.error=null;
+  try{
+   await this.persist();
+   if(this.job.scope==='all')await this.discover();else this.job.discovery={status:'complete',scope:'current'};
+   for(let i=0;i<this.job.conversations.length;i++){
+    this.check();const c=this.job.conversations[i];if(c.status==='complete')continue;
+    this.job.stage=`${i+1}/${this.job.conversations.length}：${c.name}`;
+    c.status='running';c.error=null;c.warnings=[];await this.persist();
+    for(let attempt=0;attempt<3;attempt++){
+     c.attempts++;
+     try{
+      if(this.job.scope==='all')await this.open(c);else if(current().key!==c.key)throw Error('請回到原本的聊天再續抓');
+      await this.scan(c);c.error=null;break;
+     }catch(e){c.status='failed';c.error=e.message;await this.persist();if(e.stopped||/帳號|已切換|原本的聊天/.test(e.message))throw e;if(attempt<2)await this.wait();}
+    }await this.persist();
+   }
+   this.job.status=this.job.discovery.status==='complete'&&this.job.conversations.length&&this.job.conversations.every(c=>c.status==='complete')?'complete':'partial';this.job.stage='掃描結束';await this.persist();
+  }catch(e){this.job.status=e.stopped?'interrupted':'failed';this.job.error=e.message;try{await this.persist();}catch{};}
+  finally{this.running=false;this.onUpdate(this.summary());}
+ }
 }
-
-// Export for different environments
-if (typeof module !== 'undefined' && module.exports) {
-    // Node.js environment
-    module.exports = {
-        SELECTOR_STRATEGIES,
-        querySelectorFallback,
-        querySelectorAllFallback,
-        detectStrategy,
-        loadFullChat,
-        extractTimestamp,
-        extractMessages,
-        sanitizeText
-    };
-} else if (typeof window !== 'undefined') {
-    // Browser environment
-    window.TeamsChatUtils = {
-        SELECTOR_STRATEGIES,
-        querySelectorFallback,
-        querySelectorAllFallback,
-        detectStrategy,
-        loadFullChat,
-        extractTimestamp,
-        extractMessages,
-        sanitizeText
-    };
-}
+root.TeamsChatUtils={Scanner,parseDate,makeRange,validHost,current,account,identify,prepare};
+})(globalThis);

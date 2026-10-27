@@ -3,7 +3,6 @@
    Modern dark theme with Teams-inspired accent colors
    ==================================================== */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 * {
     margin: 0;
@@ -467,3 +466,12 @@ h1 {
 .message-preview:nth-child(8) { animation-delay: 0.24s; }
 .message-preview:nth-child(9) { animation-delay: 0.27s; }
 .message-preview:nth-child(10) { animation-delay: 0.30s; }
+
+input[type="datetime-local"], .scope-select { width:100%; padding:8px; margin:5px 0 10px; background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border); border-radius:6px; }
+label { font-size:12px; color:var(--text-secondary); }
+.action-row {display:flex; gap:8px; margin:8px 0;}
+.note {font-size:11px; color:var(--text-muted); margin:8px 0;}
+
+/* Progress rows refresh while scanning; avoid replaying entrance animations. */
+.message-preview { animation: none; }
+.message-count[hidden] { display: none; }

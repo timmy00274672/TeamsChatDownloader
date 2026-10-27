@@ -1,149 +1,48 @@
-/**
- * Teams Chat Downloader - Content Script
- * Extracts chat messages from the Microsoft Teams web interface.
- *
- * Uses multiple selector strategies to handle Teams UI changes.
- * Supports auto-scrolling to load full chat history.
- */
-
-// Import shared utilities
-const {
-    SELECTOR_STRATEGIES,
-    querySelectorFallback,
-    querySelectorAllFallback,
-    detectStrategy,
-    loadFullChat,
-    extractTimestamp,
-    sanitizeText
-} = window.TeamsChatUtils || {};
-
-/**
- * Scan all visible chat messages using the detected strategy.
- */
-function extractMessages(container, strategy) {
-    const messages = [];
-    const messageElements = querySelectorAllFallback(container, strategy.message);
-    const seen = new Set(); // For deduplication
-
-    messageElements.forEach(element => {
-        const senderEl = querySelectorFallback(element, strategy.sender);
-        const contentEl = querySelectorFallback(element, strategy.content);
-        const timestampEl = querySelectorFallback(element, strategy.timestamp);
-
-        const sender = sanitizeText(senderEl?.textContent?.trim() || 'Unknown');
-        const text = sanitizeText(contentEl?.textContent?.trim() || '');
-        const timestamp = extractTimestamp(timestampEl, strategy);
-
-        // Skip empty messages
-        if (!text && !senderEl) return;
-
-        // Deduplication key
-        const dedupKey = `${sender}|${timestamp}|${text.substring(0, 50)}`;
-        if (seen.has(dedupKey)) return;
-        seen.add(dedupKey);
-
-        // Extract attachments
-        const attachments = [];
-        const attachmentElements = querySelectorAllFallback(element, strategy.attachment);
-        attachmentElements.forEach(attachment => {
-            const nameEl = querySelectorFallback(attachment, strategy.attachmentName);
-            const name = sanitizeText(nameEl?.textContent?.trim());
-            if (name) attachments.push(name);
-        });
-
-        messages.push({
-            sender,
-            text,
-            timestamp: timestamp || Date.now(),
-            attachments
-        });
-    });
-
-    return messages;
-}
-
-/**
- * Main scan function — called by the popup via message passing.
- * @param {boolean} fullHistory - If true, auto-scrolls to load all messages.
- * @param {function} onProgress - Progress callback (0-100).
- */
-async function scanChat(fullHistory = false, onProgress = null) {
-    // Use the shared detectStrategy function
-    const detected = detectStrategy();
-
-    if (!detected) {
-        return {
-            success: false,
-            error: 'Chat container not found. Make sure you have a chat open in Teams.',
-            diagnostics: {
-                url: window.location.href,
-                strategiesTried: SELECTOR_STRATEGIES.map(s => s.name)
-            }
-        };
-    }
-
-    const { strategy, container } = detected;
-
-    // Optionally load full history by auto-scrolling
-    if (fullHistory) {
-        if (onProgress) onProgress(5);
-        await loadFullChat(container, onProgress);
-    }
-
-    if (onProgress) onProgress(95);
-
-    const messages = extractMessages(container, strategy);
-
-    if (messages.length === 0) {
-        return {
-            success: false,
-            error: 'No messages found in chat. The chat may be empty or the DOM structure has changed.',
-            diagnostics: {
-                strategy: strategy.name,
-                containerFound: true,
-                url: window.location.href
-            }
-        };
-    }
-
-    // Sort by timestamp
-    messages.sort((a, b) => a.timestamp - b.timestamp);
-
-    return {
-        success: true,
-        chatData: messages,
-        messageCount: messages.length,
-        strategy: strategy.name,
-        // Preview: last 10 messages, truncated
-        preview: messages.slice(-10).map(msg => ({
-            sender: msg.sender,
-            text: msg.text.substring(0, 100) + (msg.text.length > 100 ? '...' : ''),
-            timestamp: msg.timestamp
-        }))
-    };
-}
-
-// ---- Message listener ----
-chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
-    if (request.action === 'scanChat') {
-        const fullHistory = request.fullHistory || false;
-
-        // scanChat is async, so we must return true and call sendResponse later
-        scanChat(fullHistory, (progress) => {
-            try {
-                chrome.runtime.sendMessage({ action: 'scanProgress', progress });
-            } catch (e) {
-                // Popup may have closed — ignore
-            }
-        }).then(result => {
-            sendResponse(result);
-        }).catch(error => {
-            sendResponse({
-                success: false,
-                error: `Scan failed: ${error.message}`
-            });
-        });
-
-        return true; // Keep the message channel open for async response
-    }
+/* Isolated extension bridge. Checkpoints are extension-local, per browser tab. */
+(function(){
+'use strict';
+let launching=false;
+let storageKey=null,scanner=new TeamsChatUtils.Scanner({save:async job=>{
+ if(!storageKey)throw Error('缺少本機工作識別值');
+ await chrome.storage.local.set({[storageKey]:job});
+}});
+chrome.runtime.onMessage.addListener((request,sender,respond)=>{
+ if(sender.id!==chrome.runtime.id)return;
+ const answer=async()=>{
+  if(!Number.isInteger(request.tabId))throw Error('缺少分頁識別值');
+  const key='teams-dom-job:'+request.tabId;
+  if(storageKey&&storageKey!==key)throw Error('分頁識別值不符');
+  storageKey=key;
+  switch(request.action){
+   case 'start':
+    if(scanner.running||launching)throw Error('已有掃描正在執行');
+    launching=true;
+    try { await TeamsChatUtils.identify(); TeamsChatUtils.prepare(request.options); } finally { launching=false; }
+    // Preflight completed before launching; a detached task survives popup closure.
+    scanner.start(request.options).catch(error=>console.error('Teams DOM export:',error.message));
+    return {ok:true};
+   case 'resume':{
+    if(scanner.running||launching)throw Error('已有掃描正在執行');
+    launching=true;
+    let saved;
+    try {
+    saved=scanner.job||(await chrome.storage.local.get(key))[key];
+    if(!saved)throw Error('此分頁沒有可續抓的工作');
+    await TeamsChatUtils.identify();
+    if(TeamsChatUtils.account()!==saved.account)throw Error('登入帳號與進度不同');
+    } finally { launching=false; }
+    scanner.resume(saved).catch(error=>console.error('Teams DOM export:',error.message));return {ok:true};
+   }
+   case 'stop':scanner.stop();return {ok:true};
+   case 'status':{
+    const saved=scanner.job||(await chrome.storage.local.get(key))[key];
+    if(!scanner.job&&saved){scanner.job=saved;if(['running','waiting-login'].includes(saved.status)){scanner.job.status='interrupted';scanner.job.error='網頁曾重新載入，請按續抓';}}
+    return {ok:true,running:scanner.running||launching,summary:scanner.summary()};
+   }
+   case 'result':return {ok:true,job:scanner.job||(await chrome.storage.local.get(key))[key]||null};
+   default:throw Error('不支援的操作');
+  }
+ };
+ answer().then(respond).catch(error=>respond({ok:false,error:error.message}));return true;
 });
+})();

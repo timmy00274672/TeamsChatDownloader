@@ -1,0 +1,88 @@
+const {test}=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs');const path=require('node:path');const {chromium}=require('playwright');
+const root=path.resolve(__dirname,'..'),sources=['dom.js','shared-utils.js','export-formats.js'];
+const key='19:fixture@thread.v2',other='19:second@thread.v2';
+const msg=(id,t,text='相同內容')=>`<div><span id="author-${id}">測試作者</span><time id="timestamp-${id}" datetime="${t}"></time><div id="message-body-${id}" data-mid="${id}"><div id="content-${id}">${text}</div></div></div>`;
+const row=(key,name,muted=false)=>`<div tabindex="0" role="treeitem" data-item-type="${muted?'muted-chat':'chat'}" data-fui-tree-item-value="chat|${key}"><span id="title-chat-list-item_${key}">${name}</span></div>`;
+const shell=messages=>`<style>[role=tree]{height:120px;overflow:auto}[data-tid=message-pane-list-viewport]{height:200px;overflow:auto}[id^=message-body-]{min-height:80px}</style><button data-tid="me-control-avatar-trigger" aria-label="Your profile for fixture@example.com"></button><div data-tid="app-bar-wrapper"><button aria-label="Chat">Chat</button></div><div role="tree">${row(key,'測試群組')}${row(other,'靜音會議',true)}</div><div id="chat-header-${key}"><h2 data-tid="chat-title">測試群組</h2></div><div data-tid="app-layout-area--main"><div data-tid="message-pane-list-viewport">${messages}</div></div>`;
+async function setup(){const browser=await chromium.launch({channel:'chrome',headless:true});const page=await browser.newPage();await page.route('https://teams.cloud.microsoft/**',r=>r.fulfill({body:'<html></html>',contentType:'text/html'}));await page.goto('https://teams.cloud.microsoft/');return {browser,page};}
+async function inject(page){for(const file of sources)await page.addScriptTag({path:path.join(root,file)});}
+
+test('網域、日期、邊界與未知時間輸出',async()=>{
+ const {browser,page}=await setup();try{
+  await page.setContent(shell(''));await inject(page);
+  const result=await page.evaluate(()=>{const u=TeamsChatUtils;let invalid=false;try{u.makeRange({from:'2026-02-30T09:00',to:'2026-10-27T09:00'});}catch{invalid=true;}return {host:u.validHost(location.hostname),bad:u.validHost('teams.cloud.microsoft.attacker.com'),from:u.parseDate('2026-10-27T09:00'),range:u.makeRange({},Date.parse('2026-10-27T01:00:00Z')),invalid};});
+  assert.equal(result.host,true);assert.equal(result.bad,false);assert.equal(result.from,Date.parse('2026-10-27T01:00Z'));assert.equal(result.range.to-result.range.from,86400000);assert.equal(result.invalid,true);
+  const result2=await page.evaluate(()=>{const j={status:'partial',range:{from:100,to:200},mode:'range',warnings:[],discovery:{status:'partial'},conversations:[{name:'測試',status:'partial',warnings:[],messages:[{key:'1',timestamp:100,sender:'A',text:'<script>alert(1)</script>',attachments:[]},{key:'2',timestamp:200,sender:'B',text:'不包含結束',attachments:[]},{key:'3',timestamp:null,sender:'?',text:'不明日期',rawTime:null,attachments:[]}]}]};return {data:TeamsChatFormats.exportObject(j),txt:TeamsChatFormats.format(j,'txt'),json:TeamsChatFormats.format(j,'json'),html:TeamsChatFormats.format(j,'html'),csv:TeamsChatFormats.format(j,'csv')};});
+  assert.equal(result2.data.messageCount,2);assert.match(result2.txt,/時間不明/);assert.doesNotMatch(result2.txt,/不包含結束/);assert.match(result2.html,/&lt;script&gt;/);assert.equal(JSON.parse(result2.json).conversations[0].messages[1].timestamp,null);assert.match(result2.csv,/Time/);
+ }finally{await browser.close();}
+});
+
+test('逐頁累積、DOM 回收、穩定 ID 去重與固定範圍續抓',async()=>{
+ const {browser,page}=await setup();try{
+  const all=Array.from({length:30},(_,i)=>msg(String(i+1),new Date(Date.parse('2026-10-25T00:00Z')+i*3600000).toISOString(),i%2?'相同內容':'多行<br>訊息'));
+  await page.setContent(shell(all.slice(20).join('')));await inject(page);
+  await page.evaluate(all=>{const view=document.querySelector('[data-tid="message-pane-list-viewport"]');let start=20,loading=false;view.scrollTop=view.scrollHeight;view.addEventListener('scroll',()=>{if(view.scrollTop>2||!start||loading)return;loading=true;view.setAttribute('aria-busy','true');setTimeout(()=>{start=Math.max(0,start-5);view.innerHTML=all.slice(start,start+10).join('');view.scrollTop=350;view.removeAttribute('aria-busy');loading=false;},25);});},all);
+  const r=await page.evaluate(async()=>{window.scanner=new TeamsChatUtils.Scanner({delay:20,maxSteps:100});const job=await scanner.start({scope:'current',from:'2026-10-25T15:00:00Z',to:'2026-10-26T06:00:00Z'});const saved=structuredClone(job);const first=TeamsChatFormats.exportObject(job);await scanner.resume(saved);return {first,second:TeamsChatFormats.exportObject(scanner.job)};});
+  assert.equal(r.first.status,'complete');assert.equal(r.first.messageCount,15);assert.equal(r.second.messageCount,15);assert.deepEqual(r.first.range,r.second.range);assert.equal(new Set(r.second.conversations[0].messages.map(m=>m.id)).size,15);
+ }finally{await browser.close();}
+});
+
+test('批次清單包含靜音與載入更多；單一聊天失敗不中止其他聊天',async()=>{
+ const {browser,page}=await setup();try{
+  await page.setContent(shell(msg('1','2026-10-25T00:00Z')+msg('2','2026-10-27T00:00Z')));await inject(page);
+  await page.evaluate(()=>{
+   const tree=document.querySelector('[role="tree"]'),more=document.createElement('div');more.setAttribute('role','treeitem');more.setAttribute('data-fui-tree-item-value','recent-load-next-page');more.textContent='2';more.onclick=()=>{more.remove();const e=document.createElement('div');e.setAttribute('role','treeitem');e.setAttribute('data-item-type','chat');e.setAttribute('data-fui-tree-item-value','chat|third');e.innerHTML='<span id="title-chat-list-item_third">壞掉的聊天</span>';tree.append(e);};tree.append(more);
+   for(const e of tree.querySelectorAll('[data-item-type]'))e.addEventListener('click',()=>{document.querySelector('[id^="chat-header-"]').id='chat-header-'+e.getAttribute('data-fui-tree-item-value').split('|')[1];});
+  });
+  const r=await page.evaluate(async()=>{const scanner=new TeamsChatUtils.Scanner({delay:5,maxSteps:30});const original=scanner.open.bind(scanner);scanner.open=async c=>{if(c.key==='third')throw Error('模擬載入失敗');return original(c);};return scanner.start({scope:'all',from:'2026-10-26T00:00:00Z',to:'2026-10-28T00:00:00Z'});});
+  assert.equal(r.conversations.length,3);assert.equal(r.conversations[1].name,'靜音會議');assert.equal(r.conversations[2].status,'failed');assert.equal(r.conversations[2].attempts,3);assert.equal(r.conversations[0].status,'complete');assert.equal(r.status,'partial');
+ }finally{await browser.close();}
+});
+
+test('停止、帳號切換與存檔失敗都保留可辨識的狀態',async()=>{
+ const {browser,page}=await setup();try{
+  await page.setContent(shell(msg('1','','時間不明')));await inject(page);
+  const r=await page.evaluate(async()=>{const scanner=new TeamsChatUtils.Scanner({delay:10,maxSteps:50});const promise=scanner.start({scope:'current'});setTimeout(()=>scanner.stop(),30);const job=await promise;const stopped=job.status;document.querySelector('[data-tid="me-control-avatar-trigger"]').setAttribute('aria-label','Your profile for other@example.com');let error;try{await scanner.resume(job);}catch(e){error=e.message;}return {stopped,error};});assert.equal(r.stopped,'interrupted');assert.match(r.error,/帳號/);
+  const failed=await page.evaluate(async()=>{const scanner=new TeamsChatUtils.Scanner({delay:1,save:()=>{throw Error('儲存空間已滿');}});await scanner.start({scope:'current'});return {status:scanner.job.status,error:scanner.job.error};});assert.equal(failed.status,'failed');assert.match(failed.error,/儲存空間/);
+ }finally{await browser.close();}
+});
+
+test('打包權限、共用引擎與無遠端讀取',()=>{
+ const manifest=JSON.parse(fs.readFileSync(path.join(root,'manifest.json')));assert.ok(manifest.host_permissions.includes('https://teams.cloud.microsoft/*'));assert.equal(manifest.content_scripts[0].js.join(','),'dom.js,shared-utils.js,content.js');
+ for(const file of ['shared-utils.js','dom.js','content.js','export-formats.js'])assert.doesNotMatch(fs.readFileSync(path.join(root,file),'utf8'),/\b(?:fetch|XMLHttpRequest|WebSocket)\s*\(/);
+ const user=fs.readFileSync(path.join(root,'tampermonkey/teams-chat-downloader.user.js'),'utf8');assert.match(user,/@match\s+https:\/\/teams.cloud.microsoft\/\*/);assert.ok(user.includes(fs.readFileSync(path.join(root,'shared-utils.js'),'utf8')));assert.doesNotMatch(fs.readFileSync(path.join(root,'styles.css'),'utf8'),/@import/);
+});
+
+test('擴充套件訊息橋接、面板關閉後結果保存與重新載入續抓',async()=>{
+ const {browser,page}=await setup();try{
+  await page.setContent(shell(msg('1','2026-10-27T00:00:00Z','測試訊息')));await inject(page);
+  await page.evaluate(()=>{const stored={};window.chrome={runtime:{id:'test-extension',onMessage:{addListener:f=>window.extensionListener=f}},storage:{local:{set:async v=>Object.assign(stored,structuredClone(v)),get:async key=>({[key]:structuredClone(stored[key])})}}};window.requestExtension=(action,options)=>new Promise(resolve=>extensionListener({action,options,tabId:123},{id:'test-extension'},resolve));});
+  await page.addScriptTag({path:path.join(root,'content.js')});
+  const first=await page.evaluate(async()=>{const start=await requestExtension('start',{scope:'current',mode:'visible',from:'2026-10-26T00:00:00Z',to:'2026-10-28T00:00:00Z'});await new Promise(r=>setTimeout(r,20));return {start,status:await requestExtension('status'),result:await requestExtension('result')};});
+  assert.equal(first.start.ok,true);assert.equal(first.status.running,false);assert.equal(first.status.summary.count,1);assert.equal(first.result.job.status,'partial');
+  await page.addScriptTag({path:path.join(root,'content.js')});
+  const restored=await page.evaluate(async()=>{const before=await requestExtension('status');await requestExtension('resume');await new Promise(r=>setTimeout(r,20));return {before,after:await requestExtension('result')};});
+  assert.equal(restored.before.summary.count,1);assert.equal(restored.after.job.conversations[0].messages.length,1);
+  const invalid=await page.evaluate(async()=>{document.querySelector('[id^="chat-header-"]').remove();return requestExtension('start',{scope:'current',mode:'visible'});});assert.equal(invalid.ok,false);assert.match(invalid.error,/聊天/);
+ }finally{await browser.close();}
+});
+
+test('單檔面板在 Trusted Types 限制下可建立，不使用 HTML 字串注入',async()=>{
+ const {browser,page}=await setup();try{
+  await page.setContent(shell(''));await inject(page);
+  await page.evaluate(()=>{window.GM_setValue=async()=>{};window.GM_getValue=async()=>null;const meta=document.createElement('meta');meta.httpEquiv='Content-Security-Policy';meta.content="require-trusted-types-for 'script'";document.head.append(meta);});
+  await page.evaluate(fs.readFileSync(path.join(root,'scripts/userscript-panel.js'),'utf8'));
+  assert.equal(await page.getByRole('button',{name:'Teams 匯出',exact:true}).count(),1);
+  await page.getByRole('button',{name:'Teams 匯出',exact:true}).click();
+  assert.equal(await page.getByRole('button',{name:'掃描指定時段',exact:true}).isVisible(),true);
+ }finally{await browser.close();}
+});
+
+test('個人頭像沒有 email 時可從帳號面板確認，續抓再次核對帳號',async()=>{
+ const {browser,page}=await setup();try{
+  await page.setContent(shell(msg('1','2026-10-27T00:00:00Z')));await inject(page);
+  await page.evaluate(()=>{const trigger=document.querySelector('[data-tid="me-control-avatar-trigger"]');trigger.setAttribute('aria-label','Your profile, status Available');window.currentEmail='fixture@example.com';trigger.onclick=()=>{const old=document.querySelector('[data-tid="me-control-menu-dialog"]');if(old){old.remove();return;}const e=document.createElement('div');e.setAttribute('data-tid','me-control-menu-dialog');e.textContent='測試使用者 '+currentEmail;document.body.append(e);};});
+  const result=await page.evaluate(async()=>{const s=new TeamsChatUtils.Scanner({delay:1});const j=await s.start({scope:'current',mode:'visible'});const email=j.account;window.currentEmail='other@example.com';let error;try{await s.resume(j);}catch(e){error=e.message;}return {email,error,open:!!document.querySelector('[data-tid="me-control-menu-dialog"]')};});
+  assert.equal(result.email,'fixture@example.com');assert.match(result.error,/帳號/);assert.equal(result.open,false);
+ }finally{await browser.close();}
+});
