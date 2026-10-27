@@ -182,7 +182,9 @@ class Scanner{
   for(let i=0;i<this.maxSteps;i++){
    const {raw,pane}=await this.capture(c),dated=raw.filter(m=>knownTime(m.time));
    const ordered=dated.every((m,i)=>!i||Date.parse(dated[i-1].time)<=Date.parse(m.time));
-   if(this.job.mode==='range'&&!pane.busy&&raw.length&&dated.length===raw.length&&ordered&&dated.some(m=>Date.parse(m.time)<this.job.range.from)){lower=true;c.traversal.lower='crossed-range-start';break;}
+   // System events and grouped messages may lack datetime. Keep them as unknown,
+   // but do not let them prevent the dated, ordered timeline reaching its boundary.
+   if(this.job.mode==='range'&&!pane.busy&&ordered&&dated.some(m=>Date.parse(m.time)<this.job.range.from)){lower=true;c.traversal.lower='crossed-range-start';break;}
    if(!pane.busy&&(pane.startMarker||pane.empty)){lower=true;c.traversal.lower=pane.empty?'explicit-empty':'explicit-start';break;}
    const signature=JSON.stringify([raw.map(m=>m.id||m.text),pane.top]);stable=!pane.busy&&pane.top!==null&&pane.top<=2&&signature===previous?stable+1:0;
    if(stable>=4){c.traversal.lower='observed-stable-top';c.warnings.push('頂部已穩定，但沒有明確歷史起始標記，無法確認更早內容完整載入');break;}

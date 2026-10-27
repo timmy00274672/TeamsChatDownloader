@@ -87,3 +87,29 @@ test('個人頭像沒有 email 時可從帳號面板確認，續抓再次核對�
   assert.equal(result.email,'fixture@example.com');assert.match(result.error,/帳號/);assert.equal(result.open,false);
  }finally{await browser.close();}
 });
+
+test('指定時段混有無時間紀錄仍在跨過開始時間後停止，不掃到更舊歷史',async()=>{
+ const {browser,page}=await setup();try{
+  const all=Array.from({length:30},(_,i)=>msg(String(i+1),new Date(Date.parse('2026-10-25T00:00Z')+i*3600000).toISOString()));
+  await page.setContent(shell(all.slice(20).join('')+msg('event','','沒有 datetime 的系統紀錄')));await inject(page);
+  await page.evaluate(all=>{
+   const view=document.querySelector('[data-tid="message-pane-list-viewport"]');window.oldestLoaded=20;let loading=false;view.scrollTop=view.scrollHeight;
+   view.addEventListener('scroll',()=>{if(view.scrollTop>2||!window.oldestLoaded||loading)return;loading=true;view.setAttribute('aria-busy','true');setTimeout(()=>{window.oldestLoaded=Math.max(0,window.oldestLoaded-5);view.innerHTML=all.slice(window.oldestLoaded,window.oldestLoaded+10).join('')+'<div id="message-body-event"><div id="content-event">沒有 datetime 的系統紀錄</div></div>';view.scrollTop=350;view.removeAttribute('aria-busy');loading=false;},10);});
+  },all);
+  const r=await page.evaluate(async()=>{const s=new TeamsChatUtils.Scanner({delay:20,maxSteps:100});const j=await s.start({scope:'current',from:'2026-10-25T15:00:00Z',to:'2026-10-26T06:00:00Z'});return {job:j,data:TeamsChatFormats.exportObject(j),oldestLoaded};});
+  assert.equal(r.oldestLoaded,10);assert.equal(r.job.conversations[0].traversal.lower,'crossed-range-start');
+  assert.equal(r.data.conversations[0].messages.filter(m=>m.timestamp!==null).length,15);
+  assert.equal(r.data.conversations[0].messages.filter(m=>m.timestamp===null).length,1);
+  assert.equal(r.job.status,'partial');assert.ok(r.job.conversations[0].warnings.some(w=>w.includes('缺少完整時間')));
+ }finally{await browser.close();}
+});
+
+test('沒有可確認的時間或時間亂序時，不誤判跨過開始時間',async()=>{
+ const {browser,page}=await setup();try{
+  for(const messages of [msg('event','','時間不明'),msg('new','2026-10-27T00:00Z')+msg('old','2026-10-20T00:00Z')]){
+   await page.setContent(shell(messages));await inject(page);
+   const j=await page.evaluate(()=>new TeamsChatUtils.Scanner({delay:1,maxSteps:15}).start({scope:'current',from:'2026-10-26T00:00:00Z',to:'2026-10-28T00:00:00Z'}));
+   assert.equal(j.status,'partial');assert.notEqual(j.conversations[0].traversal.lower,'crossed-range-start');
+  }
+ }finally{await browser.close();}
+});
