@@ -30,3 +30,6 @@ test('ZIP contains compact, chat, report and skipped conversations',async()=>{
 test('execute skips before opening and accepts skipped as successful completion',async()=>{
  const s=new u.Scanner();s.job={...job(),scope:'all',conversations:[s.newConversation({key:'old',latest:'2026-10-25T00:00Z'})]};s.discover=async()=>{};s.open=async()=>assert.fail('must not open');await s.execute();assert.equal(s.job.status,'complete');assert.equal(s.job.conversations[0].status,'skipped');assert.equal(s.summary().conversations[0].skipReason,'skipped: last activity before range');
 });
+test('compact duration uses this execution session after resume',()=>{
+ const j=job();j.startedAt=j.updated-60000;assert.match(f.compact(j),/duration=1.0 min/);
+});

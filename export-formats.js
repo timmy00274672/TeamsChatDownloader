@@ -37,7 +37,7 @@ function compact(job){
  const active=cs.filter(c=>c.messages.some(inRange));let images={saved:0,missing:0};
  for(const c of cs)for(const m of c.messages)for(const i of m.images||[])images[i.status==='saved'?'saved':'missing']++;
  images=j.imageReport||images;
- const duration=Math.max(0,((j.updated||j.created)-j.created)/60000);
+ const duration=Math.max(0,((j.updated||j.created)-(j.startedAt||j.created))/60000);
  const lines=[`status=${j.status} chats scanned=${cs.filter(c=>c.attempts>0||['complete','partial','failed','running'].includes(c.status)).length} skipped=${cs.filter(c=>c.status==='skipped').length} active=${active.length} in-range msgs=${cs.reduce((n,c)=>n+c.messages.filter(inRange).length,0)} no-time=${cs.reduce((n,c)=>n+c.messages.filter(m=>m.timestamp===null).length,0)} partial chats=${cs.filter(c=>c.status==='partial').length} images saved=${images.saved} missing=${images.missing} duration=${Number.isFinite(duration)?duration.toFixed(1):'0.0'} min`];
  for(const c of active){lines.push('',`## ${String(c.name).replace(/\s+/g,' ')}`);for(const m of c.messages.filter(inRange)){const t=time(m.timestamp);lines.push(`${t.slice(5,10).replace('-','/')} ${t.slice(11,16)} ${String(m.sender||'作者不明').replace(/\s+/g,' ')}: ${compactText(m)}`);}}
  return lines.join('\n');

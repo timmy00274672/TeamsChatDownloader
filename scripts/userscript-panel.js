@@ -14,7 +14,7 @@ shadow.append(style,node('section',{},
  node('label',{},node('input',{id:'saveImages',type:'checkbox',checked:''}),' 保存圖片（ZIP 分開存檔）'),node('button',{id:'enableImages'},'啟用圖片擷取（需要時）'),
  node('small',{},'可以先直接掃描。若提示圖片受限制，再啟用擷取並選此 Teams 分頁。圖片僅存本機 PNG，不上傳。'),
  node('button',{id:'start'},'掃描指定時段'),node('button',{id:'history'},'目前聊天全部歷史'),node('button',{id:'resume'},'續抓本機進度'),node('button',{id:'stop'},'停止'),
- node('label',{},'格式',node('select',{id:'format'},...['zip','txt','json','csv','html'].map(t=>node('option',{},t)))),
+ node('label',{},'格式',node('select',{id:'format'},...['zip','txt','json','csv','html'].map(t=>node('option',{value:t,...(t==='zip'?{selected:''}:{})},t)))),
  node('button',{id:'discard'},'清除進度'),node('button',{id:'log'},'下載進度紀錄'),node('button',{id:'download'},'下載目前結果'),node('p',{id:'status'},'預設最近 24 小時'),
  node('small',{},'掃描可能將聊天標為已讀。請勿切換此分頁的聊天；重新整理後可續抓。資料只存於本機 userscript 儲存空間。')
 ));
@@ -23,15 +23,17 @@ $('from').value=local(Date.now()-86400000);$('to').value=local(Date.now());
 const mediaStore=new TeamsChatImages.MediaStore();
 const captureSession=new TeamsChatImages.TabCapture({hide:()=>{const previous=[host.style.visibility,launcher.style.visibility];host.style.visibility='hidden';launcher.style.visibility='hidden';return ()=>{host.style.visibility=previous[0];launcher.style.visibility=previous[1];};},onState:ready=>{$('enableImages').textContent=ready?'圖片擷取已啟用':'啟用圖片擷取（需要時）';}});
 const checkpoints=new TeamsChatUtils.Checkpoints(mediaStore,()=>GM_getValue(key,null),value=>GM_setValue(key,value));
-const scanner=new TeamsChatUtils.Scanner({mediaStore,captureProvider:captureSession,save:job=>checkpoints.save(job),onInterrupt:job=>TeamsChatUtils.autoDownload(job,download),onUpdate:s=>{$('status').textContent=TeamsChatUtils.statusText(s);for(const id of ['start','history','resume','enableImages','saveImages'])$(id).disabled=scanner.running;if(!scanner.running)captureSession.stop();}});
+const scanner=new TeamsChatUtils.Scanner({mediaStore,captureProvider:captureSession,save:job=>checkpoints.save(job),onInterrupt:finishDownload,onTerminal:finishDownload,onUpdate:s=>{$('status').textContent=TeamsChatUtils.statusText(s);for(const id of ['start','history','resume','enableImages','saveImages'])$(id).disabled=scanner.running;if(!scanner.running)captureSession.stop();}});
 $('enableImages').onclick=async()=>{try{await captureSession.enable();$('status').textContent='圖片擷取已啟用，現在可以開始掃描。';}catch(e){$('status').textContent='無法啟用圖片擷取：'+e.message;}};
 window.addEventListener('pagehide',()=>captureSession.stop());
 launcher.onclick=()=>{host.style.display=host.style.display==='none'?'block':'none';};$('close').onclick=()=>host.style.display='none';
-const run=mode=>{if(autoPending||loadingCheckpoint)return;return scanner.start({scope:$('scope').value,mode,from:$('from').value,to:$('to').value,captureImages:$('saveImages').checked}).catch(e=>$('status').textContent=e.message);};
+async function finishDownload(job){await TeamsChatUtils.autoDownload(job,download);await checkpoints.save(job);}
+$('format').onchange=()=>GM_setValue(key+'-format',$('format').value||'zip');
+const run=mode=>{if(autoPending||loadingCheckpoint)return;return scanner.start({scope:$('scope').value,mode,from:$('from').value,to:$('to').value,captureImages:$('saveImages').checked,format:$('format').value||'zip'}).catch(e=>$('status').textContent=e.message);};
 $('start').onclick=()=>run('range');$('history').onclick=()=>run('history');$('stop').onclick=()=>scanner.stop();
-$('resume').onclick=async()=>{if(autoPending||loadingCheckpoint||scanner.running)return;try{const job=scanner.job||await checkpoints.load();await scanner.resume(job,{captureImages:$('saveImages').checked});await TeamsChatUtils.autoDownload(scanner.job,download);}catch(e){$('status').textContent=e.message;}};
-async function download(type){try{const job=scanner.job||await checkpoints.load();const blob=type==='zip'?await TeamsChatArchive.build(job,mediaStore):new Blob([TeamsChatFormats.format(job,type)],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`teams-chat-${new Date(job.created).toISOString().slice(0,10)}.${type}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),120000);}catch(e){$('status').textContent=e.message;}}
-$('download').onclick=()=>download($('format').value);
+$('resume').onclick=async()=>{if(autoPending||loadingCheckpoint||scanner.running)return;try{const job=scanner.job||await checkpoints.load();await scanner.resume(job,{captureImages:$('saveImages').checked});}catch(e){$('status').textContent=e.message;}};
+async function download(type){try{const job=scanner.job||await checkpoints.load();const blob=type==='zip'?await TeamsChatArchive.build(job,mediaStore):new Blob([TeamsChatFormats.format(job,type)],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`teams-chat-${new Date(job.created).toISOString().slice(0,10)}.${type}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),120000);}catch(e){$('status').textContent=e.message;throw e;}}
+$('download').onclick=()=>download($('format').value||'zip');
 let autoPending=false,waitCancelled=false,loadingCheckpoint=true;
 $('stop').onclick=()=>{waitCancelled=true;scanner.stop();};
 $('discard').onclick=async()=>{waitCancelled=true;scanner.stop();if(scanner.running){$('status').textContent='停止中；停止後再按清除進度';return;}if(scanner.job)scanner.job.abandoned=true;await checkpoints.clear();scanner.job=null;$('status').textContent='已清除進度';};
@@ -54,18 +56,18 @@ async function autoRun(options,consumeHash=false,resumeJob=null){
    if(profile?.getClientRects().length&&document.querySelector('[role="tree"],[data-tid="app-bar-wrapper"]')){try{await TeamsChatUtils.identify();break;}catch{}}
    await new Promise(r=>setTimeout(r,500));
   }
-  if(scanner.running)return;
+  if(scanner.running||waitCancelled)return;
+  $('scope').value='all';$('from').value=local(Date.parse(options.from));$('to').value=local(Date.parse(options.to));$('format').value=options.format||'zip';await GM_setValue(key+'-format',$('format').value);
   if(consumeHash)history.replaceState(history.state,'',TeamsChatUtils.strippedURL(location));
-  $('scope').value='all';$('from').value=local(Date.parse(options.from));$('to').value=local(Date.parse(options.to));$('format').value=options.format;
   // Automatic runs use local DOM image capture; never request screen sharing here.
-  const previous=scanner.job;
-  try{if(resumeJob)await scanner.resume(resumeJob);else await scanner.start({...options,captureImages:$('saveImages').checked});}
-  finally{if(scanner.job&&scanner.job!==previous)await TeamsChatUtils.autoDownload(scanner.job,download);}
- }catch(e){if(resumeJob){scanner.job=resumeJob;scanner.job.status='interrupted';scanner.job.error=e.message;TeamsChatUtils.logProgress(scanner.job,e);await checkpoints.save(scanner.job);await TeamsChatUtils.autoDownload(scanner.job,download);}$('status').textContent=e.message;}finally{autoPending=false;}
+  if(resumeJob)await scanner.resume(resumeJob);else await scanner.start({...options,captureImages:$('saveImages').checked});
+ }catch(e){if(resumeJob){if(scanner.job?.id!==resumeJob.id)scanner.job=resumeJob;scanner.job.status='interrupted';scanner.job.error=e.message;TeamsChatUtils.logProgress(scanner.job,e);await finishDownload(scanner.job);}$('status').textContent=e.message;}finally{autoPending=false;if(!waitCancelled&&location.hash.includes('teams-export=all'))setTimeout(hashTrigger,500);}
 }
 function hashTrigger(){try{const options=TeamsChatUtils.parseAutoHash(location.hash);if(options)void autoRun(options,true);}catch(e){host.style.display='block';$('status').textContent=e.message;}}
 window.addEventListener('hashchange',hashTrigger);
+window.addEventListener('popstate',hashTrigger);
+setInterval(()=>{if(!autoPending&&!loadingCheckpoint&&!scanner.running&&!waitCancelled)hashTrigger();},1000);
 // Alt+Shift+E: previous weekday 07:00 Taipei through now, all chats, ZIP download.
 window.addEventListener('keydown',event=>{if(event.altKey&&event.shiftKey&&!event.ctrlKey&&!event.metaKey&&event.code==='KeyE'&&!event.repeat&&!event.isComposing){event.preventDefault();const r=TeamsChatUtils.defaultAutoRange();void autoRun({scope:'all',mode:'range',from:new Date(r.from).toISOString(),to:new Date(r.to).toISOString(),format:'zip',autodownload:true});}});
-void (async()=>{try{const job=await checkpoints.load();loadingCheckpoint=false;if(TeamsChatUtils.resumable(job)){const options={...job,from:new Date(job.range.from).toISOString(),to:new Date(job.range.to).toISOString()};await autoRun(options,!!TeamsChatUtils.parseAutoHash(location.hash),job);}else hashTrigger();}catch(e){loadingCheckpoint=false;host.style.display='block';$('status').textContent=e.message;}})();
+void (async()=>{try{$('format').value=await GM_getValue(key+'-format','zip')||'zip';const job=await checkpoints.load();loadingCheckpoint=false;if(TeamsChatUtils.resumable(job)){const options={...job,from:new Date(job.range.from).toISOString(),to:new Date(job.range.to).toISOString()};await autoRun(options,!!TeamsChatUtils.parseAutoHash(location.hash),job);}else hashTrigger();}catch(e){loadingCheckpoint=false;host.style.display='block';$('status').textContent=e.message;}})();
 })();
