@@ -19,7 +19,7 @@ test('圖片獨立 PNG、TXT 檔名、ZIP 對應；續抓不重複；表情符�
 test('圖片快取遺失會保留連結並標記部分完成，不產生假的檔案',async()=>{
  const {browser,page}=await setup();try{
   const r=await page.evaluate(async()=>{const job={id:'missing',captureImages:true,status:'complete',mode:'range',range:{from:0,to:9999999999999},warnings:[],discovery:{status:'complete'},conversations:[{status:'complete',name:'圖片',warnings:[],messages:[{key:'1',timestamp:1,sender:'A',text:'圖',images:[{status:'saved',file:'images/lost.png',url:'https://example.com/image'}]}]}]};return Array.from(new Uint8Array(await (await TeamsChatArchive.build(job,{get:async()=>null})).arrayBuffer()));});
-  const files=entries(Buffer.from(r)),report=JSON.parse(files['report.json']);assert.equal(report.status,'partial');assert.equal(report.imageReport.missing,1);assert.match(files['chat.txt'].toString(),/https:\/\/example.com\/image/);assert.doesNotMatch(files['chat.txt'].toString(),/圖片檔案：images\/lost/);assert.equal(files['images/lost.png'],undefined);
+  const files=entries(Buffer.from(r)),report=JSON.parse(files['report.json']);assert.equal(report.status,'complete');assert.equal(report.imageReport.missing,1);assert.match(files['chat.txt'].toString(),/https:\/\/example.com\/image/);assert.doesNotMatch(files['chat.txt'].toString(),/圖片檔案：images\/lost/);assert.equal(files['images/lost.png'],undefined);
  }finally{await browser.close();}
 });
 

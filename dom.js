@@ -7,7 +7,7 @@ function readMessages() {
     const id = body.getAttribute('data-mid') || body.id.slice('message-body-'.length);
     const byId = prefix => document.getElementById(prefix + id);
     const content = byId('content-') || body.querySelector('[data-message-content]');
-    const time = byId('timestamp-');
+    const time = byId('timestamp-') || body.querySelector('time');
     const author = byId('author-');
     const links = [...(content || body).querySelectorAll('a[href]')].map(a => ({text: a.innerText || a.getAttribute('aria-label') || '', url: a.href})).filter(a => /^https?:/.test(a.url));
     const attachments = byId('attachments-') || body.querySelector('[data-tid="file-attachment-grid"]');
@@ -20,8 +20,8 @@ function readMessages() {
     // A quoted reply is part of the body; preserve the quote text and DOM target, if exposed.
     const quote = content?.querySelector('[data-track-module-name="messageQuotedReply"], [data-tid*="quoted"], [data-reply-to-id], blockquote');
     const parent = body.getAttribute('data-reply-to-id') || quote?.getAttribute('data-reply-to-id') || quote?.getAttribute('data-message-id') || null;
-    return {id: id || null, author: author?.innerText?.trim() || null, rawTime: time?.getAttribute('datetime') || time?.getAttribute('aria-label') || time?.textContent || null,
-      time: time?.getAttribute('datetime') || null,
+    return {id: id || null, author: author?.innerText?.trim() || null, rawTime: time?.getAttribute('datetime') || time?.getAttribute('aria-label') || time?.getAttribute('title') || time?.textContent || null,
+      time: time?.getAttribute('datetime') || null, timeLabels: [time?.getAttribute('aria-label'),time?.getAttribute('title'),time?.textContent].filter(Boolean),
       text: [content?.innerText?.trim() || '', ...images.map(x=>'[圖片：'+x+']')].filter(Boolean).join('\n') || body.innerText.trim(),
       images: root.TeamsChatImages ? root.TeamsChatImages.candidates(body).map(root.TeamsChatImages.describe) : [],
       links, parent, quote: quote?.getAttribute('aria-label') || quote?.innerText || null, index,
