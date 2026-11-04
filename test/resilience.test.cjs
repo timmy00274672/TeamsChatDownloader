@@ -42,3 +42,24 @@ test('autodownload ignores active jobs, handles empty terminal exports and retri
  j.status='partial';await assert.rejects(u.autoDownload(j,async()=>{throw Error('download failed');}));
  assert.equal(j.autoDownloadDone,false);await u.autoDownload(j,async()=>{});assert.equal(j.autoDownloadDone,true);
 });
+test('message timestamps use labels, plausible ids and continuation fallback',()=>{
+ const id='1793700000000';assert.equal(u.messageTime({id}).timestamp,Number(id));assert.equal(u.messageTime({id}).timestampSource,'message-id');
+ const pm=u.messageTime({timeLabels:['invalid','2026/11/4 下午 3:05'],id});const am=u.messageTime({rawTime:'2026/11/4 上午 3:05'});assert.equal(pm.timestampSource,'time-label');assert.equal(pm.timestamp-am.timestamp,12*3600000);
+ assert.equal(pm.timestamp,Date.parse('2026-11-04T07:05:00Z'));assert.equal(am.timestamp,Date.parse('2026-11-03T19:05:00Z'));
+ assert.equal(u.messageTime({rawTime:'2026/2/30 PM 3:05'}).timestamp,null);assert.equal(u.messageTime({rawTime:'2026/11/4 PM 3:05:60'}).timestamp,null);
+ assert.equal(u.messageTime({time:'2026-11-04T00:00:00Z',id}).timestampSource,'datetime');
+ assert.deepEqual(u.messageTime({id:'bad'}, {timestamp:42}),{timestamp:42,timestampSource:'inherited',timestampInferred:true});
+ assert.equal(u.messageTime({id:'1000000000000',author:'Alice'}).timestamp,null);
+});
+test('skipped chats share a retained progress entry',()=>{
+ const j=job();j.conversations=Array.from({length:200},()=>({status:'pending'}));
+ for(const c of j.conversations){c.status='skipped';j.stage='略過聊天';u.logProgress(j);j.stage='other '+j.conversations.indexOf(c);u.logProgress(j);}
+ assert.equal(j.progressLog.filter(e=>e.stage==='略過聊天').length,1);assert.equal(j.progressLog.find(e=>e.stage==='略過聊天').count,200);assert.equal(j.progressLog.length,150);
+});
+test('stable top and benign warnings complete, but truncation and scroll cap remain partial',async()=>{
+ for(const kind of ['benign','truncated','cap']){
+  const s=new u.Scanner({maxSteps:kind==='cap'?1:6});s.job={...job(),mode:'history',captureImages:true};const c=s.job.conversations[0];c.messages=[{timestamp:null,authorMissing:true,images:[{status:'failed'}]}];c.warnings=kind==='truncated'?['部分訊息未展開全文']:[];
+  s.capture=async()=>({raw:[],pane:{busy:false,bottom:0,top:0}});s.viewport=()=>({scrollHeight:100,clientHeight:100,scrollTop:0});s.wait=async()=>{};
+  await s.scan(c);assert.equal(c.status,kind==='benign'?'complete':'partial');
+ }
+});

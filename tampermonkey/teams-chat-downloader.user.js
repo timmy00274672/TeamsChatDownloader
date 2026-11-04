@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Teams Chat Downloader (DOM local)
 // @namespace    https://github.com/rahulmasal/TeamsChatDownloader
-// @version      1.4.2
+// @version      1.4.3
 // @description  Local DOM-only chat export with date ranges, batching and checkpoints.
 // @author       Rahul Masal; local adaptation
 // @match        https://teams.microsoft.com/*
@@ -37,16 +37,22 @@ function cropRect(e){
  return {x:Math.max(0,r.left),y:Math.max(0,r.top),width:r.width,height:r.height,viewWidth:innerWidth,viewHeight:innerHeight};
 }
 async function capture(e,provider,check=()=>{}){
- check();if(!e.isConnected)throw Error('圖片已離開頁面，請續抓重試');
- if(!e.complete||!e.naturalWidth){await Promise.race([new Promise(resolve=>{e.addEventListener('load',resolve,{once:true});e.addEventListener('error',resolve,{once:true});}),new Promise(r=>setTimeout(r,2500))]);}
- check();if(!e.complete||!e.naturalWidth)throw Error('圖片尚未載入，已保留連結');
- if(e.naturalWidth*e.naturalHeight<=24000000){try{const canvas=document.createElement('canvas');canvas.width=e.naturalWidth;canvas.height=e.naturalHeight;canvas.getContext('2d').drawImage(e,0,0);return {blob:await pngBlob(canvas),method:'rendered-canvas'};}catch{/* Cross-origin pixels require a user-authorized tab capture. */}}
- if(!provider?.capture)throw unavailable('圖片擷取未啟用，請先啟用再續抓');
  const scrollers=[];for(let p=e.parentElement;p;p=p.parentElement)if(p.scrollHeight>p.clientHeight||p.scrollWidth>p.clientWidth)scrollers.push([p,p.scrollTop,p.scrollLeft]);
  const originalStyle=e.getAttribute('style'),originalWindow=[scrollX,scrollY];
+ const failure=(code,message)=>Object.assign(Error(message||code),{code});
  try{
+  check();if(!e.isConnected)throw failure('element-recycled');
+  e.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});await frame();check();
+  if(!e.isConnected)throw failure('element-recycled');
+  const deadline=Date.now()+2500;
+  if(!e.complete||!e.naturalWidth)await Promise.race([new Promise(resolve=>{e.addEventListener('load',resolve,{once:true});e.addEventListener('error',resolve,{once:true});}),new Promise(r=>setTimeout(r,Math.max(0,deadline-Date.now())))]);
+  check();if(!e.isConnected)throw failure('element-recycled');if(!e.complete||!e.naturalWidth)throw failure('not-loaded');
+  if(e.decode)await Promise.race([e.decode().catch(()=>{}),new Promise(r=>setTimeout(r,Math.max(0,deadline-Date.now())))]);
+  check();if(!e.isConnected)throw failure('element-recycled');
+  if(e.naturalWidth*e.naturalHeight<=24000000){try{const canvas=document.createElement('canvas');canvas.width=e.naturalWidth;canvas.height=e.naturalHeight;canvas.getContext('2d').drawImage(e,0,0);return {blob:await pngBlob(canvas),method:'rendered-canvas'};}catch{/* Cross-origin pixels require an authorized tab capture. */}}
+  if(!provider?.capture)throw failure('tainted-canvas-no-capture');
   e.style.setProperty('max-width',Math.floor(innerWidth*.65)+'px','important');e.style.setProperty('max-height',Math.floor(innerHeight*.45)+'px','important');e.style.setProperty('width','auto','important');e.style.setProperty('height','auto','important');e.style.setProperty('object-fit','contain','important');
-  e.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});await frame();await new Promise(r=>setTimeout(r,150));check();if(!e.isConnected)throw Error('捲動時圖片被回收，請續抓重試');
+  e.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});await frame();await new Promise(r=>setTimeout(r,150));check();if(!e.isConnected)throw failure('element-recycled');
   const blob=await provider.capture(()=>{check();return cropRect(e);});check();return {blob,method:'tab-screenshot'};
  }finally{if(originalStyle===null)e.removeAttribute('style');else e.setAttribute('style',originalStyle);for(const [p,top,left]of scrollers){p.scrollTop=top;p.scrollLeft=left;}window.scrollTo(...originalWindow);await frame();}
 }
@@ -88,7 +94,7 @@ function readMessages() {
     const id = body.getAttribute('data-mid') || body.id.slice('message-body-'.length);
     const byId = prefix => document.getElementById(prefix + id);
     const content = byId('content-') || body.querySelector('[data-message-content]');
-    const time = byId('timestamp-');
+    const time = byId('timestamp-') || body.querySelector('time');
     const author = byId('author-');
     const links = [...(content || body).querySelectorAll('a[href]')].map(a => ({text: a.innerText || a.getAttribute('aria-label') || '', url: a.href})).filter(a => /^https?:/.test(a.url));
     const attachments = byId('attachments-') || body.querySelector('[data-tid="file-attachment-grid"]');
@@ -101,8 +107,8 @@ function readMessages() {
     // A quoted reply is part of the body; preserve the quote text and DOM target, if exposed.
     const quote = content?.querySelector('[data-track-module-name="messageQuotedReply"], [data-tid*="quoted"], [data-reply-to-id], blockquote');
     const parent = body.getAttribute('data-reply-to-id') || quote?.getAttribute('data-reply-to-id') || quote?.getAttribute('data-message-id') || null;
-    return {id: id || null, author: author?.innerText?.trim() || null, rawTime: time?.getAttribute('datetime') || time?.getAttribute('aria-label') || time?.textContent || null,
-      time: time?.getAttribute('datetime') || null,
+    return {id: id || null, author: author?.innerText?.trim() || null, rawTime: time?.getAttribute('datetime') || time?.getAttribute('aria-label') || time?.getAttribute('title') || time?.textContent || null,
+      time: time?.getAttribute('datetime') || null, timeLabels: [time?.getAttribute('aria-label'),time?.getAttribute('title'),time?.textContent].filter(Boolean),
       text: [content?.innerText?.trim() || '', ...images.map(x=>'[圖片：'+x+']')].filter(Boolean).join('\n') || body.innerText.trim(),
       images: root.TeamsChatImages ? root.TeamsChatImages.candidates(body).map(root.TeamsChatImages.describe) : [],
       links, parent, quote: quote?.getAttribute('aria-label') || quote?.innerText || null, index,
@@ -149,6 +155,17 @@ root.TeamsChatDOM={readMessages,readRail,readPane};
 const {readMessages,readRail,readPane}=root.TeamsChatDOM;
 const validHost=host=>['teams.microsoft.com','teams.cloud.microsoft','teams.live.com'].includes(host);
 const knownTime=value=> typeof value==='string' && /(Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
+function messageTime(m, previous){
+ if(knownTime(m.time))return {timestamp:Date.parse(m.time),timestampSource:'datetime'};
+ for(const raw of m.timeLabels?.length?m.timeLabels:[m.rawTime||'']){
+ if(knownTime(raw))return {timestamp:Date.parse(raw),timestampSource:'time-label'};
+ const match=raw.match(/(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})\s*(上午|下午|AM|PM)?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?/i);
+ if(match){let [,y,mo,d,period,h,mi,sec]=match;h=+h;if(period){if(h<1||h>12)return {timestamp:null};h=h%12+(/下午|PM/i.test(period)?12:0);}const date=new Date(Date.UTC(+y,+mo-1,+d,h,+mi,+(sec||0)));if(date.getUTCFullYear()===+y&&date.getUTCMonth()===+mo-1&&date.getUTCDate()===+d&&date.getUTCHours()===h&&date.getUTCMinutes()===+mi&&date.getUTCSeconds()===+(sec||0))return {timestamp:date.getTime()-28800000,timestampSource:'time-label'};}
+ }
+ const id=String(m.id||'');const n=Number(id);if(/^\d{13}$/.test(id)&&n>=Date.UTC(2015,0,1)&&n<=Date.now()+86400000)return {timestamp:n,timestampSource:'message-id',timestampInferred:true};
+ if(!m.author&&previous?.timestamp!=null)return {timestamp:previous.timestamp,timestampSource:'inherited',timestampInferred:true};
+ return {timestamp:null,timestampUnknownReason:'no valid timestamp in message DOM'};
+}
 function parseDate(value){
  const local=/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::(\d{2}))?$/.exec(value||'');
  const input=local?`${local[1]}T${local[2]}:${local[3]||'00'}+08:00`:value;
@@ -185,9 +202,10 @@ function logProgress(j,error,now=Date.now()){
  const index=j.currentChatIndex?j.currentChatIndex-1:j.conversations.findIndex(c=>c.status==='running');
  const entry={t:j.lastProgressAt,stage:j.stage,chatIndex:index+1,chatTotal:j.conversations.length,chatName:j.conversations[index]?.name};
  if(error)Object.assign(entry,{error:j.lastError,stackSnippet:String(error.stack||'').slice(0,1200)});
+ if(j.stage==='略過聊天'&&!error){j.progressLog=j.progressLog||[];let summary=j.progressLog.find(e=>e.stage==='略過聊天');if(!summary){summary={stage:'略過聊天',count:0};j.progressLog.push(summary);}summary.count=j.conversations.filter(c=>c.status==='skipped').length;return;}
  const last=j.progressLog?.at(-1);
  if(last&&last.stage===entry.stage&&last.chatIndex===entry.chatIndex&&last.error===entry.error){last.repeat=(last.repeat||1)+1;last.t=entry.t;return;}
- j.progressLog=[...(j.progressLog||[]),entry].slice(-150);
+ const summary=j.progressLog?.find(e=>e.stage==='略過聊天');const entries=[...(j.progressLog||[]).filter(e=>e!==summary),entry].slice(summary?-149:-150);j.progressLog=summary?[summary,...entries]:entries;
 }
 function statusText(s){return `${s.status}｜${s.stage}\n聊天 ${s.conversations.length}（略過 ${s.conversations.filter(c=>c.status==='skipped').length}）｜訊息 ${s.count}｜圖片 ${s.imageCount||0}\n${s.lastError||s.error||''}\n${s.lastStage||''}｜${s.lastProgressAt||''}`;}
 async function autoDownload(job,download){
@@ -321,13 +339,15 @@ class Scanner{
   }
   const raw=readMessages(),pane=readPane();
   if(pane.replies)c.warnings.push('此聊天含獨立討論串，尚未展開，結果部分完成');
+  let previous=null;
   for(const m of raw){
-   const time=knownTime(m.time)?Date.parse(m.time):null;
+   const timing=messageTime(m,previous);
+   const author=m.author||(!m.author&&previous?.sender!=='作者不明'?previous?.sender:null);
    const identity=m.id?'id:'+m.id:'uncertain:'+this.job.id+':'+(++this.sequence);
-   const converted={id:m.id,key:identity,sender:m.author||'作者不明',authorMissing:!m.author,timestamp:time,timestampUnknownReason:time===null?'no valid timestamp in message DOM':undefined,rawTime:m.rawTime,text:m.text,attachments:m.links||[],parent:m.parent,quote:m.quote,uncertainIdentity:!m.id};
+   const converted={id:m.id,key:identity,sender:author||'作者不明',authorMissing:!author,authorInferred:!!(!m.author&&author),...timing,rawTime:m.rawTime,text:m.text,attachments:m.links||[],parent:m.parent,quote:m.quote,uncertainIdentity:!m.id};
    const old=c.messages.find(x=>x.key===identity);
-   converted.images=(m.images||[]).map(image=>{const prior=old?.images?.find(x=>x.index===image.index&&x.identity===image.identity&&x.url===image.url);return prior?{...image,...prior}:{...image,status:'link-only'};});
-   if(old)Object.assign(old,converted);else c.messages.push(converted);
+   converted.images=(m.images||[]).map(image=>{const prior=old?.images?.find(x=>x.index===image.index&&x.identity===image.identity&&x.url===image.url);return prior?{...image,...prior}:{...image,status:'link-only',error:this.job.captureImages?'not-attempted':'capture-disabled'};});
+   if(old)Object.assign(old,converted);else c.messages.push(converted);previous=converted;
    if(m.truncated)c.warnings.push('部分訊息未展開全文');
    if(!m.id)c.warnings.push('部分訊息沒有穩定識別值，保留可能重複的紀錄');
   }
@@ -339,15 +359,15 @@ class Scanner{
   for(const item of raw){
    const m=item.id?c.messages.find(x=>x.id===item.id):c.messages.find(x=>x.text===item.text&&x.sender===(item.author||'作者不明'));
    if(!m||!this.selected(c).includes(m))continue;
-   const body=document.getElementById('message-body-'+item.id);if(!body)continue;
+   const body=document.getElementById('message-body-'+item.id);if(!body){for(const image of m.images||[])if(image.status!=='saved')image.error='element-recycled';continue;}
    const elements=root.TeamsChatImages.candidates(body);
    for(const image of m.images||[]){
     this.check();if(image.status==='saved')continue;
-    const e=elements[image.index];if(!e)continue;const r=e.getBoundingClientRect(),view=this.viewport().getBoundingClientRect();if(r.bottom<=view.top||r.top>=view.bottom)continue;
+    const e=elements[image.index];if(!e){image.error='element-recycled';continue;}
     this.job.stage=`保存圖片：${c.name} / ${m.id||'未識別訊息'} / ${image.index+1}`;
     const check=()=>{this.check();if(readPane().headerId!=='chat-header-'+c.key)throw Error('聊天已切換；停止以免混入其他聊天');};
-    try{check();const {blob,method}=await root.TeamsChatImages.capture(e,this.captureProvider,check);check();const file=await root.TeamsChatImages.filename(c.key,m.key,image.index);await this.mediaStore.put(this.job.id,file,blob);Object.assign(image,{file,status:'saved',method,bytes:blob.size,error:null});}
-    catch(error){Object.assign(image,{status:'failed',error:error.message});if(error.stopped||error.captureUnavailable||/已切換/.test(error.message))throw error;}
+    try{check();let result;for(let attempt=0;attempt<3;attempt++){try{result=await root.TeamsChatImages.capture(e,this.captureProvider,check);break;}catch(error){if(error.stopped||error.captureUnavailable||/已切換/.test(error.message)||attempt===2)throw error;}}const {blob,method}=result;check();const file=await root.TeamsChatImages.filename(c.key,m.key,image.index);await this.mediaStore.put(this.job.id,file,blob);Object.assign(image,{file,status:'saved',method,bytes:blob.size,error:null});}
+    catch(error){Object.assign(image,{status:'failed',error:error.code||error.message||'capture-failed'});if(error.stopped||/已切換/.test(error.message))throw error;}
     await this.persist();
    }
   }
@@ -377,7 +397,7 @@ class Scanner{
    if(stable>=4){c.traversal.lower='observed-stable-top';c.warnings.push('頂部已穩定，但沒有明確歷史起始標記，無法確認更早內容完整載入');break;}
    previous=signature;this.viewport().scrollTop-=this.viewport().clientHeight*.65;await this.wait();
   }
-  if(this.job.captureImages&&this.selected(c).some(m=>(m.images||[]).some(image=>image.status!=='saved')))c.warnings.push('部分圖片未保存，TXT 已保留連結與原因；可啟用圖片擷取後續抓');
+  if(this.selected(c).some(m=>(m.images||[]).some(image=>image.status!=='saved')))c.warnings.push('部分圖片未保存，TXT 已保留連結與原因；可啟用圖片擷取後續抓');
   if(!bottom)c.warnings.push('未確認最新訊息的底部邊界');
   if(!lower&&!c.traversal.lower)c.warnings.push('尚未覆蓋開始時間，達到捲動上限');
   if(c.messages.some(m=>m.timestamp===null))c.warnings.push('部分紀錄缺少完整時間，未判定是否在範圍內');
@@ -385,8 +405,8 @@ class Scanner{
   c.warnings=[...new Set(c.warnings)];
   if(c.traversal.lower==='crossed-range-start')c.reason='stopped early: reached messages older than range';
   const rangeCovered=this.job.mode==='range'&&c.traversal.lower==='crossed-range-start';
-  const blocking=c.warnings.filter(w=>!w.startsWith('部分紀錄缺少完整時間')&&!(rangeCovered&&['部分紀錄缺少作者','未確認最新訊息的底部邊界'].includes(w)));
-  c.status=(rangeCovered||(bottom&&lower))&&!blocking.length?'complete':'partial';this.ensureReason(c);
+  const blocking=c.warnings.some(w=>w.includes('獨立討論串')||w.includes('未展開全文'));
+  c.status=(rangeCovered||(bottom&&!!c.traversal.lower))&&!blocking?'complete':'partial';this.ensureReason(c);
  }
  ensureReason(c){
   if(!['partial','failed'].includes(c.status))return;
@@ -400,7 +420,7 @@ class Scanner{
    if(this.job.scope==='all'){if(this.job.discovery?.status!=='complete')await this.discover();}else this.job.discovery={status:'complete',scope:'current'};
    for(let i=0;i<this.job.conversations.length;i++){
     this.check();this.job.currentChatIndex=i+1;const c=this.job.conversations[i];if(c.status==='complete')continue;
-    if(skipBeforeRange(this.job,c)){c.status='skipped';c.skipReason='skipped: last activity before range';c.error=c.skipReason;await this.persist();continue;}
+    if(skipBeforeRange(this.job,c)){c.status='skipped';c.skipReason='skipped: last activity before range';c.error=c.skipReason;this.job.stage='略過聊天';await this.persist();continue;}
     if(c.status==='skipped'){c.status='pending';c.skipReason=null;}
     this.job.stage=`${i+1}/${this.job.conversations.length}：${c.name}`;
     c.status='running';c.error=null;c.reason=null;c.warnings=[];await this.persist();
@@ -412,12 +432,12 @@ class Scanner{
      }catch(e){c.status='failed';c.error=e.message;c.reason=e.message;await this.persist();if(e.stopped||e.captureUnavailable||/帳號|已切換|原本的聊天/.test(e.message))throw e;if(attempt<2)await this.wait();}
     }this.ensureReason(c);await this.persist();
    }
-   this.job.status=this.job.discovery.status==='complete'&&this.job.conversations.length&&this.job.conversations.every(c=>['complete','skipped'].includes(c.status))?'complete':'partial';this.job.stage='掃描結束';await this.persist();
+   this.job.status=this.job.discovery.status==='complete'&&this.job.conversations.length&&this.job.conversations.every(c=>['complete','skipped'].includes(c.status))?'complete':'partial';this.job.warningSummary={chats:this.job.conversations.filter(c=>c.warnings?.length).length,warnings:this.job.conversations.reduce((n,c)=>n+(c.warnings?.length||0),0)};this.job.stage='掃描結束';await this.persist();
   }catch(e){this.job.status=e.stopped?'interrupted':'failed';this.job.error=e.message;logProgress(this.job,e);try{await this.persist();}catch{};}
   finally{clearInterval(watchdog);for(const c of this.job.conversations)this.ensureReason(c);this.running=false;this.onUpdate(this.summary());await this.onTerminal(this.job);}
  }
 }
-root.TeamsChatUtils={Scanner,Checkpoints,strippedURL,resumable,logProgress,statusText,autoDownload,parseDate,makeRange,defaultAutoRange,parseAutoHash,skipBeforeRange,validHost,current,account,identify,prepare};
+root.TeamsChatUtils={Scanner,Checkpoints,strippedURL,resumable,logProgress,statusText,autoDownload,parseDate,makeRange,defaultAutoRange,parseAutoHash,skipBeforeRange,messageTime,validHost,current,account,identify,prepare};
 })(globalThis);
 
 /* Shared by the popup and standalone userscript. */
@@ -460,7 +480,7 @@ function compact(job){
  for(const c of cs)for(const m of c.messages)for(const i of m.images||[])images[i.status==='saved'?'saved':'missing']++;
  images=j.imageReport||images;
  const duration=Math.max(0,((j.updated||j.created)-(j.startedAt||j.created))/60000);
- const lines=[`status=${j.status} chats scanned=${cs.filter(c=>c.attempts>0||['complete','partial','failed','running'].includes(c.status)).length} skipped=${cs.filter(c=>c.status==='skipped').length} active=${active.length} in-range msgs=${cs.reduce((n,c)=>n+c.messages.filter(inRange).length,0)} no-time=${cs.reduce((n,c)=>n+c.messages.filter(m=>m.timestamp===null).length,0)} partial chats=${cs.filter(c=>c.status==='partial').length} images saved=${images.saved} missing=${images.missing} duration=${Number.isFinite(duration)?duration.toFixed(1):'0.0'} min`];
+ const lines=[`status=${j.status} chats scanned=${cs.filter(c=>c.attempts>0||['complete','partial','failed','running'].includes(c.status)).length} skipped=${cs.filter(c=>c.status==='skipped').length} active=${active.length} in-range msgs=${cs.reduce((n,c)=>n+c.messages.filter(inRange).length,0)} no-time=${cs.reduce((n,c)=>n+c.messages.filter(m=>m.timestamp===null).length,0)} partial chats=${cs.filter(c=>c.status==='partial').length} warn chats=${cs.filter(c=>c.warnings?.length).length} images saved=${images.saved} missing=${images.missing} duration=${Number.isFinite(duration)?duration.toFixed(1):'0.0'} min`];
  for(const c of active){lines.push('',`## ${String(c.name).replace(/\s+/g,' ')}`);for(const m of c.messages.filter(inRange)){const t=time(m.timestamp);lines.push(`${t.slice(5,10).replace('-','/')} ${t.slice(11,16)} ${String(m.sender||'作者不明').replace(/\s+/g,' ')}: ${compactText(m)}`);}}
  return lines.join('\n');
 }
@@ -498,10 +518,11 @@ async function build(job,store){
  for(const c of j.conversations)for(const m of c.messages)for(const image of m.images||[]){
   if(image.status==='saved'&&image.file&&!seen.has(image.file)){
    const blob=await store.get(j.id,image.file);if(blob){entries.push({name:image.file,data:blob});seen.add(image.file);saved++;}
-   else{image.status='missing';image.error='本機圖片快取已不存在，需啟用圖片後重新掃描';missing++;c.status='partial';}
+   else{image.status='missing';image.error='本機圖片快取已不存在，需啟用圖片後重新掃描';missing++;c.warnings=c.warnings||[];c.warnings.push('部分圖片未保存');}
   }else if(image.status!=='saved'&&j.captureImages)missing++;
  }
- j.imageReport={saved,missing};if(missing){j.status='partial';j.warnings.push(`${missing} 張圖片未保存，請查看各訊息的圖片連結與原因。`);}
+ j.warningSummary={chats:j.conversations.filter(c=>c.warnings?.length).length,warnings:j.conversations.reduce((n,c)=>n+(c.warnings?.length||0),0)};
+ j.imageReport={saved,missing};if(missing){j.warnings.push(`${missing} 張圖片未保存，請查看各訊息的圖片連結與原因。`);}
  entries.unshift({name:'progress-log.json',data:JSON.stringify(job.progressLog||[],null,2)},{name:'compact.txt',data:root.TeamsChatFormats.compact(j)},{name:'chat.txt',data:root.TeamsChatFormats.format(j,'txt')},{name:'report.json',data:JSON.stringify(j,null,2)});
  return zip(entries);
 }

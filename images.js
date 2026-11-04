@@ -23,16 +23,22 @@ function cropRect(e){
  return {x:Math.max(0,r.left),y:Math.max(0,r.top),width:r.width,height:r.height,viewWidth:innerWidth,viewHeight:innerHeight};
 }
 async function capture(e,provider,check=()=>{}){
- check();if(!e.isConnected)throw Error('圖片已離開頁面，請續抓重試');
- if(!e.complete||!e.naturalWidth){await Promise.race([new Promise(resolve=>{e.addEventListener('load',resolve,{once:true});e.addEventListener('error',resolve,{once:true});}),new Promise(r=>setTimeout(r,2500))]);}
- check();if(!e.complete||!e.naturalWidth)throw Error('圖片尚未載入，已保留連結');
- if(e.naturalWidth*e.naturalHeight<=24000000){try{const canvas=document.createElement('canvas');canvas.width=e.naturalWidth;canvas.height=e.naturalHeight;canvas.getContext('2d').drawImage(e,0,0);return {blob:await pngBlob(canvas),method:'rendered-canvas'};}catch{/* Cross-origin pixels require a user-authorized tab capture. */}}
- if(!provider?.capture)throw unavailable('圖片擷取未啟用，請先啟用再續抓');
  const scrollers=[];for(let p=e.parentElement;p;p=p.parentElement)if(p.scrollHeight>p.clientHeight||p.scrollWidth>p.clientWidth)scrollers.push([p,p.scrollTop,p.scrollLeft]);
  const originalStyle=e.getAttribute('style'),originalWindow=[scrollX,scrollY];
+ const failure=(code,message)=>Object.assign(Error(message||code),{code});
  try{
+  check();if(!e.isConnected)throw failure('element-recycled');
+  e.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});await frame();check();
+  if(!e.isConnected)throw failure('element-recycled');
+  const deadline=Date.now()+2500;
+  if(!e.complete||!e.naturalWidth)await Promise.race([new Promise(resolve=>{e.addEventListener('load',resolve,{once:true});e.addEventListener('error',resolve,{once:true});}),new Promise(r=>setTimeout(r,Math.max(0,deadline-Date.now())))]);
+  check();if(!e.isConnected)throw failure('element-recycled');if(!e.complete||!e.naturalWidth)throw failure('not-loaded');
+  if(e.decode)await Promise.race([e.decode().catch(()=>{}),new Promise(r=>setTimeout(r,Math.max(0,deadline-Date.now())))]);
+  check();if(!e.isConnected)throw failure('element-recycled');
+  if(e.naturalWidth*e.naturalHeight<=24000000){try{const canvas=document.createElement('canvas');canvas.width=e.naturalWidth;canvas.height=e.naturalHeight;canvas.getContext('2d').drawImage(e,0,0);return {blob:await pngBlob(canvas),method:'rendered-canvas'};}catch{/* Cross-origin pixels require an authorized tab capture. */}}
+  if(!provider?.capture)throw failure('tainted-canvas-no-capture');
   e.style.setProperty('max-width',Math.floor(innerWidth*.65)+'px','important');e.style.setProperty('max-height',Math.floor(innerHeight*.45)+'px','important');e.style.setProperty('width','auto','important');e.style.setProperty('height','auto','important');e.style.setProperty('object-fit','contain','important');
-  e.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});await frame();await new Promise(r=>setTimeout(r,150));check();if(!e.isConnected)throw Error('捲動時圖片被回收，請續抓重試');
+  e.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});await frame();await new Promise(r=>setTimeout(r,150));check();if(!e.isConnected)throw failure('element-recycled');
   const blob=await provider.capture(()=>{check();return cropRect(e);});check();return {blob,method:'tab-screenshot'};
  }finally{if(originalStyle===null)e.removeAttribute('style');else e.setAttribute('style',originalStyle);for(const [p,top,left]of scrollers){p.scrollTop=top;p.scrollLeft=left;}window.scrollTo(...originalWindow);await frame();}
 }

@@ -14,7 +14,7 @@ test('hash opt in, defaults, encoded offsets and invalid ranges',()=>{
 });
 test('skip only valid activity strictly before all-chat range',()=>{
  const job={scope:'all',mode:'range',range:{from:Date.parse('2026-10-26T00:00Z')}};
- for(const latest of [null,'bad','2026-10-26T00:00Z','2026-10-27T00:00Z'])assert.equal(u.skipBeforeRange(job,{latest}),false);
+ for(const latest of [null,'','昨日','2 days ago','bad','2026-10-26T00:00Z','2026-10-27T00:00Z'])assert.equal(u.skipBeforeRange(job,{latest}),false);
  assert.equal(u.skipBeforeRange(job,{latest:'2026-10-25T00:00Z'}),true);
  assert.equal(u.skipBeforeRange({...job,scope:'current'},{latest:'2026-10-25T00:00Z'}),false);
 });
