@@ -14,7 +14,7 @@ test('hash opt in, defaults, encoded offsets and invalid ranges',()=>{
 });
 test('skip only valid activity strictly before all-chat range',()=>{
  const job={scope:'all',mode:'range',range:{from:Date.parse('2026-10-26T00:00Z')}};
- for(const latest of [null,'bad','2026-10-26T00:00Z','2026-10-27T00:00Z'])assert.equal(u.skipBeforeRange(job,{latest}),false);
+ for(const latest of [null,'','昨日','2 days ago','bad','2026-10-26T00:00Z','2026-10-27T00:00Z'])assert.equal(u.skipBeforeRange(job,{latest}),false);
  assert.equal(u.skipBeforeRange(job,{latest:'2026-10-25T00:00Z'}),true);
  assert.equal(u.skipBeforeRange({...job,scope:'current'},{latest:'2026-10-25T00:00Z'}),false);
 });
@@ -29,4 +29,7 @@ test('ZIP contains compact, chat, report and skipped conversations',async()=>{
 });
 test('execute skips before opening and accepts skipped as successful completion',async()=>{
  const s=new u.Scanner();s.job={...job(),scope:'all',conversations:[s.newConversation({key:'old',latest:'2026-10-25T00:00Z'})]};s.discover=async()=>{};s.open=async()=>assert.fail('must not open');await s.execute();assert.equal(s.job.status,'complete');assert.equal(s.job.conversations[0].status,'skipped');assert.equal(s.summary().conversations[0].skipReason,'skipped: last activity before range');
+});
+test('compact duration uses this execution session after resume',()=>{
+ const j=job();j.startedAt=j.updated-60000;assert.match(f.compact(j),/duration=1.0 min/);
 });

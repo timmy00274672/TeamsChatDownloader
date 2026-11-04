@@ -113,3 +113,31 @@ before the range start. Missing/invalid activity times are scanned normally.
 Skipped chats remain in `report.json` with their status and reason. ZIPs include
 `compact.txt`: Taipei timestamps, in-range messages only, condensed replies and
 image markers, plus counts for skipped chats, unknown times and image results.
+
+### v1.4.1 restart resilience
+
+The observed idle reset is explained by the missing startup checkpoint loader in
+v1.4.0: clearing the opt-in hash left no startup trigger after a script restart.
+The reason Teams restarted remains an unproven hypothesis (SPA navigation or a
+storage failure). Hash consumption now preserves `history.state` and any trailing
+router fragment, without assigning location. Opening each chat no longer clicks
+the Chat app button when its tree is already present.
+
+Full snapshots (including messages) now live in IndexedDB alongside image blobs;
+GM storage holds metadata, download intent and the latest 150 progress events.
+A snapshot is committed before its GM pointer. Existing inline GM checkpoints
+remain readable. Startup waits for Teams and resumes running/waiting jobs and
+interrupted jobs with unfinished chats. Stop retains progress; 清除進度 abandons
+the checkpoint pointer after scanning stops. Old local blobs are retained.
+
+Errors and a five-minute no-persist watchdog retain diagnostics and attempt partial
+ZIP downloads for automatic jobs. Page exit also attempts a partial download;
+browsers may cancel asynchronous work during unload, so the durable checkpoint
+and download after resume are the fallback. A download still depends on browser
+download permissions. The panel and ZIP expose `progress-log.json`.
+
+Verify with a synthetic chat: trigger an automatic ZIP export, reload mid-scan
+once a checkpoint exists, confirm the original range and download intent resume,
+then Stop and inspect the partial ZIP's report/log. Test 清除進度 after Stop and
+confirm a subsequent reload stays idle. Test with image capture disabled unless
+screen capture is explicitly needed; screen sharing cannot survive a reload.

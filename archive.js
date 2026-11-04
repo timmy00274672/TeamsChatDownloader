@@ -21,11 +21,12 @@ async function build(job,store){
  for(const c of j.conversations)for(const m of c.messages)for(const image of m.images||[]){
   if(image.status==='saved'&&image.file&&!seen.has(image.file)){
    const blob=await store.get(j.id,image.file);if(blob){entries.push({name:image.file,data:blob});seen.add(image.file);saved++;}
-   else{image.status='missing';image.error='本機圖片快取已不存在，需啟用圖片後重新掃描';missing++;c.status='partial';}
+   else{image.status='missing';image.error='本機圖片快取已不存在，需啟用圖片後重新掃描';missing++;c.warnings=c.warnings||[];c.warnings.push('部分圖片未保存');}
   }else if(image.status!=='saved'&&j.captureImages)missing++;
  }
- j.imageReport={saved,missing};if(missing){j.status='partial';j.warnings.push(`${missing} 張圖片未保存，請查看各訊息的圖片連結與原因。`);}
- entries.unshift({name:'compact.txt',data:root.TeamsChatFormats.compact(j)},{name:'chat.txt',data:root.TeamsChatFormats.format(j,'txt')},{name:'report.json',data:JSON.stringify(j,null,2)});
+ j.warningSummary={chats:j.conversations.filter(c=>c.warnings?.length).length,warnings:j.conversations.reduce((n,c)=>n+(c.warnings?.length||0),0)};
+ j.imageReport={saved,missing};if(missing){j.warnings.push(`${missing} 張圖片未保存，請查看各訊息的圖片連結與原因。`);}
+ entries.unshift({name:'progress-log.json',data:JSON.stringify(job.progressLog||[],null,2)},{name:'compact.txt',data:root.TeamsChatFormats.compact(j)},{name:'chat.txt',data:root.TeamsChatFormats.format(j,'txt')},{name:'report.json',data:JSON.stringify(j,null,2)});
  return zip(entries);
 }
 root.TeamsChatArchive={zip,build};
